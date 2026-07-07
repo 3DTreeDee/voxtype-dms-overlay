@@ -1,0 +1,31 @@
+{
+  "id": "voxtypeOverlay",
+  "name": "VoxType Recording Overlay",
+  "description": "State-reactive full-screen recording overlay for VoxType: dims every monitor, cuts out the active window with a themed highlight border, and shows a pulsing mic while dictation is live.",
+  "category": "utilities",
+  "version": "1.0.0",
+  "author": "Robert Dannenbring",
+  "icon": "mic",
+  "type": "daemon",
+  "component": "./OverlayDaemon.qml",
+  "settings": "./Settings.qml",
+  "capabilities": [
+    "ipc"
+  ],
+  "compositors": [
+    "hyprland"
+  ],
+  "distro": [
+    "any"
+  ],
+  "dependencies": [
+    "dms",
+    "voxtype",
+    "hyprland"
+  ],
+  "permissions": [
+    "process",
+    "settings_read",
+    "settings_write"
+  ]
+}
