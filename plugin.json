@@ -5,6 +5,7 @@
   "category": "utilities",
   "version": "1.0.0",
   "author": "Robert Dannenbring",
+  "repo": "https://github.com/rdannenbring/voxtype-dms-overlay",
   "icon": "mic",
   "type": "daemon",
   "component": "./OverlayDaemon.qml",
