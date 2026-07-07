@@ -1,11 +1,7 @@
 # VoxType Recording Overlay (DankMaterialShell plugin)
 
-A native [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell)
-(DMS / Quickshell) plugin that shows a recording overlay while
-[VoxType](https://github.com/peteonrails/voxtype) is dictating. It dims every
-monitor, cuts a clear hole around the window you were focused on (so you can see
-where your dictated text will land), draws a themed highlight border around it,
-and shows a pulsing mic. An optional **✕ button** (top-right, one per monitor)
+A native [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) (DMS / Quickshell) plugin that shows a recording overlay while
+[VoxType](https://github.com/peteonrails/voxtype) is dictating. It dims every monitor, cuts a clear hole around the window you were focused on (so you can see where your dictated text will land), draws a themed highlight border around it, and shows a pulsing mic. An optional **✕ button** (top-right, one per monitor)
 cancels the current dictation by mouse.
 
 It's **state-reactive** — the plugin watches VoxType's status and shows/hides
@@ -14,11 +10,11 @@ overlay appears, and when it stops the overlay disappears.
 
 > ## ⚠️ Compatibility — read first
 >
-> - **DankMaterialShell:** built and tested on DMS **git `1.4.0-871-g8a1acb63`**
->   + Quickshell **git `0.3.0`**. It uses DMS's standard plugin API (daemon
->   plugins, `PluginService`, `ColorSetting`/`SliderSetting`/…), so a **recent
->   DMS is recommended**. Older stable releases are **untested** and may lack
->   parts of this API.
+> - **DankMaterialShell ≥ 1.4.0** — declared via `requires_dms` in `plugin.json`,
+>   so DMS marks the plugin incompatible on older versions. It uses DMS's
+>   standard plugin API (daemon plugins, `PluginService`, the setting
+>   components). Built and tested on DMS git `1.4.0-871-g8a1acb63` + Quickshell
+>   git `0.3.0`.
 > - **Hyprland is required** for the active-window cutout (it shells out to
 >   `hyprctl`). Your Hyprland config can be the classic `.conf` **or** the new
 >   `.lua` — **it makes no difference**; the plugin never reads your Hyprland
