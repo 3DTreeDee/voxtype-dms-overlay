@@ -27,8 +27,11 @@ PanelWindow {
     WlrLayershell.exclusiveZone: -1
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
 
-    // Empty input region → fully click-through (pure-visual overlay).
-    mask: Region {}
+    // Input region = ONLY the ✕ button (when shown); everything else stays
+    // click-through, so the overlay never traps the pointer.
+    mask: Region {
+        item: (win.daemon && win.daemon.closeButtonEnabled) ? closeBtn : null
+    }
 
     anchors {
         top: true
@@ -180,6 +183,40 @@ PanelWindow {
             property: "opacity"
             value: 1.0
             when: !(win.daemon && win.daemon.pulseEnabled)
+        }
+    }
+
+    // ── Close button (✕) — manual escape hatch, one per monitor ──────────────
+    // The ONLY interactive part of the surface (see `mask` above): the rest is
+    // click-through. Clicking it cancels the current dictation (discard, no
+    // text), which flips VoxType to idle and the overlay hides.
+    Rectangle {
+        id: closeBtn
+        visible: win.daemon ? win.daemon.closeButtonEnabled : false
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.topMargin: 28
+        anchors.rightMargin: 28
+        width: 48
+        height: 48
+        radius: 24
+        color: closeMouse.containsMouse ? Qt.rgba(0.8, 0.2, 0.2, 0.85) : Qt.rgba(0, 0, 0, 0.55)
+        border.width: 2
+        border.color: win.daemon ? win.daemon.borderColor : "white"
+
+        DankIcon {
+            anchors.centerIn: parent
+            name: "close"
+            size: 26
+            color: "white"
+        }
+
+        MouseArea {
+            id: closeMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: if (win.daemon) win.daemon.cancelRecording()
         }
     }
 }

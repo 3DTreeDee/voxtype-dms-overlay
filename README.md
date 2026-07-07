@@ -8,11 +8,15 @@ While VoxType is recording or transcribing, it dims every monitor, cuts a clear
 hole around the window you were focused on (so you can see where dictated text
 will land), draws a themed highlight border around it, and shows a pulsing mic.
 It is **state-reactive**: it watches VoxType's status and shows/hides itself —
-no launch script, no watchdog, no `✕` button.
+no launch script and no watchdog. An optional **✕ button** (top-right, one per
+monitor) is a mouse escape hatch that cancels the current dictation.
 
-This coexists with (does not replace) the portable
-[voxtype tray + GTK overlay](https://github.com/) projects — those stay the
-"any Wayland desktop / any SNI bar" option. This is the "DMS user" option.
+This coexists with (does not replace) the portable tray + GTK overlay projects —
+[voxtype-hyprland-overlay](https://github.com/rdannenbring/voxtype-hyprland-overlay)
+and
+[voxtype-hyprland-overlay-tray](https://github.com/rdannenbring/voxtype-hyprland-overlay-tray)
+— those stay the "any Wayland desktop / any SNI bar" option. This is the "DMS
+user" option.
 
 ## Requirements
 
@@ -49,8 +53,11 @@ audio-only:
 - **`OverlayWindow.qml`** — one `WlrLayershell.Overlay` `PanelWindow` per screen.
   The monitor with the active window draws a four-rectangle dim "frame" leaving
   the window clear (no shaders/masks) plus a highlight border; other monitors
-  dim fully. The focused monitor also shows the pulsing mic + label. The surface
-  is fully click-through (empty input `mask`), so recording never traps input.
+  dim fully. The focused monitor also shows the pulsing mic + label, and (if enabled) the
+  ✕ button. The surface is click-through **except** the ✕: the input `mask` is
+  set to just that button's rect, so a stray click elsewhere passes through and
+  recording never traps the pointer. The ✕ runs `voxtype record cancel`
+  (discard, nothing typed) → state goes idle → the overlay hides.
 - **Teardown** is declarative: each window's `visible` is bound to `active`, so
   Quickshell destroys the layer surface the instant recording ends or the plugin
   is disabled. Monitor hotplug is handled by the `Variants` over
@@ -76,9 +83,19 @@ audio-only:
 | Pulse min opacity | `pulseMinPct` | 35% |
 | Pulse max opacity | `pulseMaxPct` | 100% |
 | Pulse period | `pulsePeriodMs` | 2000ms |
+| Close button (✕) | `closeButtonEnabled` | on |
 | Safety auto-hide | `backstopSeconds` | 5s |
 
 All settings apply live — no DMS restart required.
+
+## Reloading after editing the plugin
+
+DMS does **not** hot-reload plugin QML on file save. After editing any of the
+`.qml` files, reload just this plugin from disk (no shell restart needed):
+
+```bash
+dms ipc call plugins reload voxtypeOverlay
+```
 
 ## Not in this plugin (by design)
 

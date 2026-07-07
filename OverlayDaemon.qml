@@ -32,6 +32,7 @@ PluginComponent {
     readonly property real pulseMax: (pluginData && pluginData.pulseMaxPct !== undefined ? pluginData.pulseMaxPct : 100) / 100
     readonly property int pulsePeriodMs: (pluginData && pluginData.pulsePeriodMs !== undefined) ? pluginData.pulsePeriodMs : 2000
     readonly property int backstopSeconds: (pluginData && pluginData.backstopSeconds !== undefined) ? pluginData.backstopSeconds : 5
+    readonly property bool closeButtonEnabled: (pluginData && pluginData.closeButtonEnabled !== undefined) ? pluginData.closeButtonEnabled : true
 
     // ── State ────────────────────────────────────────────────────────────────
     property string statusClass: "idle"
@@ -156,6 +157,12 @@ PluginComponent {
         // Prefer the focused monitor for the mic; fall back to the cutout
         // monitor, then the first screen.
         root.micMonitorName = focused ? focused.name : (valid ? root.cutMonitorName : (Quickshell.screens.length > 0 ? Quickshell.screens[0].name : ""));
+    }
+
+    // Manual escape hatch (the ✕ button): cancel the current recording/
+    // transcription without output. State flips to idle → the overlay hides.
+    function cancelRecording() {
+        Proc.runCommand("voxtypeOverlay.cancel", ["voxtype", "record", "cancel"], (stdout, exitCode) => {});
     }
 
     // ── Per-screen overlay surfaces ───────────────────────────────────────────

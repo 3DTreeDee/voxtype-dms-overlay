@@ -132,6 +132,13 @@ PluginSettings {
         unit: "ms"
     }
 
+    ToggleSetting {
+        settingKey: "closeButtonEnabled"
+        label: "Close button (✕)"
+        description: "Show a ✕ in the top-right of each monitor to cancel the current dictation by mouse. The rest of the overlay stays click-through."
+        defaultValue: true
+    }
+
     SliderSetting {
         settingKey: "backstopSeconds"
         label: "Safety auto-hide"
