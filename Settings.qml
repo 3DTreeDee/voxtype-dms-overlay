@@ -20,7 +20,7 @@ PluginSettings {
 
     StyledText {
         width: parent.width
-        text: "Dims the screen and highlights the active window while VoxType is recording or transcribing. Audio (beeps/ducking) stays with the shell helper — set OVERLAY_ENABLED=false in ~/.config/voxtype-overlay/config.sh so it no longer launches the GTK overlay."
+        text: "Dims the screen and highlights the active window while VoxType is recording or transcribing. This is a pure-visual overlay — for start/stop beeps, enable VoxType's own [audio.feedback] in config.toml."
         font.pixelSize: Theme.fontSizeSmall
         color: Theme.surfaceVariantText
         wrapMode: Text.WordWrap

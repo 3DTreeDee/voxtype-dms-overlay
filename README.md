@@ -12,12 +12,24 @@ It's **state-reactive** — the plugin watches VoxType's status and shows/hides
 itself. There's nothing to wire together: whenever VoxType starts recording the
 overlay appears, and when it stops the overlay disappears.
 
+> ## ⚠️ Compatibility — read first
+>
+> - **DankMaterialShell:** built and tested on DMS **git `1.4.0-871-g8a1acb63`**
+>   + Quickshell **git `0.3.0`**. It uses DMS's standard plugin API (daemon
+>   plugins, `PluginService`, `ColorSetting`/`SliderSetting`/…), so a **recent
+>   DMS is recommended**. Older stable releases are **untested** and may lack
+>   parts of this API.
+> - **Hyprland is required** for the active-window cutout (it shells out to
+>   `hyprctl`). Your Hyprland config can be the classic `.conf` **or** the new
+>   `.lua` — **it makes no difference**; the plugin never reads your Hyprland
+>   config, only the `hyprctl` CLI. **Hyprland's Lua config is NOT required.**
+>   Without Hyprland the overlay still dims + shows the mic, just no cutout.
+
 ## Requirements
 
-- **DankMaterialShell** (Quickshell) — this is a DMS plugin.
+- **DankMaterialShell** (Quickshell) — this is a DMS plugin. See Compatibility above.
 - **VoxType**, installed and running (the `voxtype` daemon, on your `PATH`).
-- **Hyprland** — the active-window cutout uses `hyprctl activewindow`/`monitors`.
-  Without Hyprland the overlay still dims + shows the mic, but there's no cutout.
+- **Hyprland** — for the active-window cutout (any config format; see above).
 
 ## Install
 
@@ -28,9 +40,11 @@ ln -sfn ~/Development/voxtype-dms-overlay ~/.config/DankMaterialShell/plugins/vo
 
 Then enable it in **DMS Settings → Plugins → VoxType Recording Overlay**.
 
-> Editing the plugin later? DMS doesn't hot-reload plugin QML on save — reload
-> just this plugin (no shell restart) with:
-> `dms ipc call plugins reload voxtypeOverlay`
+> Editing the plugin later? DMS doesn't hot-reload plugin QML on save. To reload
+> it (no full shell restart), do any of:
+> - click the **↻ refresh icon** next to the plugin in **Settings → Plugins**, or
+> - run `dms ipc call plugins reload voxtypeOverlay`, or
+> - `dms restart` (heavier — restarts the whole shell).
 
 ## Using it
 
@@ -40,10 +54,11 @@ start recording — either works:
 - **VoxType's built-in hotkey** — on by default (`[hotkey]` in
   `~/.config/voxtype/config.toml`). Press it; the overlay appears.
 - **A compositor keybind** bound to `voxtype record toggle` — recommended on
-  Hyprland/Sway. Example (Hyprland Lua config):
-  ```lua
-  hl.bind("code:191", hl.dsp.exec_cmd("voxtype record toggle"))
+  Hyprland/Sway. In Hyprland's classic config (`.conf`):
   ```
+  bind = , code:191, exec, voxtype record toggle
+  ```
+  (Hyprland's newer `.lua` config works too — `hl.bind("code:191", hl.dsp.exec_cmd("voxtype record toggle"))` — but neither is required by the plugin.)
   If you use a compositor bind, disable the built-in one: `[hotkey] enabled = false`.
 
 Start recording and the overlay does the rest — no launch script, no watchdog.
