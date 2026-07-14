@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Common
 import qs.Modules.Plugins
 
@@ -41,6 +42,10 @@ PluginComponent {
     // True while VoxType's status is cleanly readable. Goes false when the
     // command errors/times out (voxtype absent, config broken, daemon down).
     property bool statusReadable: true
+    // True once we've successfully read VoxType's state file. When live, the
+    // FileView below drives detection event-driven (near-zero latency) and the
+    // poll drops to a slow liveness/backstop cadence.
+    property bool stateFileLive: false
 
     // Visible while VoxType reports it is capturing or transcribing, unless the
     // safety backstop has tripped because state went unreadable.
@@ -57,16 +62,49 @@ PluginComponent {
     property int cutH: 0
     readonly property int cutPadding: 8  // px breathing room around the window (matches the GTK overlay)
 
-    // Poll fast (responsive recording detection) while VoxType is readable or
-    // we're actively showing; back right off when VoxType is unreadable and
-    // we're idle, so a missing/broken VoxType doesn't spawn a failing process
-    // ~2.5×/sec forever. A broken VoxType can't record, so there's no latency
-    // cost — the first clean read snaps us back to the fast cadence.
+    // Detection is primarily event-driven off VoxType's state file (see the
+    // FileView below), so the poll is just a backstop: slow when the state file
+    // is live (only to keep `lastGoodReadMs` fresh and catch daemon death), fast
+    // when the file is unavailable (poll is then the sole detection path), and
+    // right off when VoxType is unreadable and we're idle (so a missing/broken
+    // VoxType doesn't spawn a failing process forever).
     readonly property int fastPollMs: 400
+    readonly property int livePollMs: 1000
     readonly property int idleErrorPollMs: 3000
-    readonly property int pollIntervalMs: (!statusReadable && !recordingActive) ? idleErrorPollMs : fastPollMs
+    readonly property int pollIntervalMs: (!statusReadable && !recordingActive) ? idleErrorPollMs
+                                        : (stateFileLive ? livePollMs : fastPollMs)
 
-    // ── State polling ─────────────────────────────────────────────────────────
+    // VoxType's state file: $XDG_RUNTIME_DIR/voxtype/state — a single word
+    // ("idle"/"recording"/"transcribing") the daemon rewrites on every state
+    // change. Watching it gives instant, subprocess-free detection.
+    readonly property string voxStatePath: {
+        const rt = Quickshell.env("XDG_RUNTIME_DIR");
+        return rt ? (rt + "/voxtype/state") : "";
+    }
+
+    function _applyStateWord(t) {
+        const word = (t === undefined || t === null) ? "" : ("" + t).trim();
+        if (word === "")
+            return;
+        root.statusClass = word;
+        root.lastGoodReadMs = Date.now();
+        root.statusReadable = true;
+        root.backstopTripped = false;
+        root.stateFileLive = true;
+    }
+
+    // Event-driven state detection. onFileChanged (inotify) → reload → onLoaded.
+    FileView {
+        id: stateView
+        path: root.voxStatePath
+        blockLoading: false
+        watchChanges: true
+        onLoaded: root._applyStateWord(text())
+        onFileChanged: stateView.reload()
+        onLoadFailed: root.stateFileLive = false
+    }
+
+    // ── State polling (backstop / fallback) ────────────────────────────────────
     function fetchStatus() {
         Proc.runCommand("voxtypeOverlay.status", ["voxtype", "status", "--format", "json"], (stdout, exitCode) => {
             if (exitCode === 0 && stdout && stdout.trim() !== "") {
@@ -76,13 +114,17 @@ PluginComponent {
                     root.lastGoodReadMs = Date.now();
                     root.backstopTripped = false;
                     root.statusReadable = true;
+                    // Bridge: if the state file wasn't loadable yet (e.g. VoxType
+                    // started after us), try again now that it's clearly running.
+                    if (!root.stateFileLive && root.voxStatePath !== "")
+                        stateView.reload();
                     return;
                 } catch (e) {
                     // malformed payload → treat like an unreadable state
                 }
             }
             root._handleUnreadable();
-        }, 250);
+        }, 0);
     }
 
     // Backstop: if we're currently showing but can no longer read VoxType's
@@ -113,24 +155,32 @@ PluginComponent {
             cutValid = false;
     }
 
+    // Fire both hyprctl queries concurrently (they're independent) and apply
+    // once both have returned. `undefined` = "not back yet"; a resolved query is
+    // null / [] which is still !== undefined, so the join fires exactly once.
     function captureCutout() {
+        let aw = undefined;
+        let mons = undefined;
+        function tryApply() {
+            if (aw !== undefined && mons !== undefined)
+                root._applyCapture(aw, mons);
+        }
         Proc.runCommand("voxtypeOverlay.activewindow", ["hyprctl", "activewindow", "-j"], (awOut, awExit) => {
-            let aw = null;
             try {
                 aw = (awExit === 0 && awOut && awOut.trim() !== "") ? JSON.parse(awOut.trim()) : null;
             } catch (e) {
                 aw = null;
             }
-            Proc.runCommand("voxtypeOverlay.monitors", ["hyprctl", "monitors", "-j"], (monOut, monExit) => {
-                let mons = [];
-                try {
-                    mons = (monExit === 0 && monOut && monOut.trim() !== "") ? JSON.parse(monOut.trim()) : [];
-                } catch (e) {
-                    mons = [];
-                }
-                root._applyCapture(aw, mons);
-            }, 250);
-        }, 250);
+            tryApply();
+        }, 0);
+        Proc.runCommand("voxtypeOverlay.monitors", ["hyprctl", "monitors", "-j"], (monOut, monExit) => {
+            try {
+                mons = (monExit === 0 && monOut && monOut.trim() !== "") ? JSON.parse(monOut.trim()) : [];
+            } catch (e) {
+                mons = [];
+            }
+            tryApply();
+        }, 0);
     }
 
     function _applyCapture(aw, mons) {
