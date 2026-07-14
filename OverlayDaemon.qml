@@ -38,6 +38,9 @@ PluginComponent {
     property string statusClass: "idle"
     property bool backstopTripped: false
     property double lastGoodReadMs: 0
+    // True while VoxType's status is cleanly readable. Goes false when the
+    // command errors/times out (voxtype absent, config broken, daemon down).
+    property bool statusReadable: true
 
     // Visible while VoxType reports it is capturing or transcribing, unless the
     // safety backstop has tripped because state went unreadable.
@@ -54,7 +57,14 @@ PluginComponent {
     property int cutH: 0
     readonly property int cutPadding: 8  // px breathing room around the window (matches the GTK overlay)
 
-    readonly property int pollIntervalMs: 400
+    // Poll fast (responsive recording detection) while VoxType is readable or
+    // we're actively showing; back right off when VoxType is unreadable and
+    // we're idle, so a missing/broken VoxType doesn't spawn a failing process
+    // ~2.5×/sec forever. A broken VoxType can't record, so there's no latency
+    // cost — the first clean read snaps us back to the fast cadence.
+    readonly property int fastPollMs: 400
+    readonly property int idleErrorPollMs: 3000
+    readonly property int pollIntervalMs: (!statusReadable && !recordingActive) ? idleErrorPollMs : fastPollMs
 
     // ── State polling ─────────────────────────────────────────────────────────
     function fetchStatus() {
@@ -65,6 +75,7 @@ PluginComponent {
                     root.statusClass = s.class || s.alt || "idle";
                     root.lastGoodReadMs = Date.now();
                     root.backstopTripped = false;
+                    root.statusReadable = true;
                     return;
                 } catch (e) {
                     // malformed payload → treat like an unreadable state
@@ -77,6 +88,7 @@ PluginComponent {
     // Backstop: if we're currently showing but can no longer read VoxType's
     // state (daemon killed, socket gone, …), hide after `backstopSeconds`.
     function _handleUnreadable() {
+        root.statusReadable = false;
         if (root.recordingActive && root.lastGoodReadMs > 0 && (Date.now() - root.lastGoodReadMs) > root.backstopSeconds * 1000) {
             root.backstopTripped = true;
         }
