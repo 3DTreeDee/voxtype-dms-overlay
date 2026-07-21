@@ -26,6 +26,13 @@ PluginSettings {
         wrapMode: Text.WordWrap
     }
 
+    ToggleSetting {
+        settingKey: "overlayEnabled"
+        label: "Recording overlay"
+        description: "Show the full-screen dim + cutout while recording. Turn off to use only the bar widget (tray-style control) without the overlay."
+        defaultValue: true
+    }
+
     SliderSetting {
         settingKey: "dimOpacityPct"
         label: "Dim opacity"

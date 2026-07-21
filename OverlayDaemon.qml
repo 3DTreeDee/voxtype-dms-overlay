@@ -34,6 +34,10 @@ PluginComponent {
     readonly property int pulsePeriodMs: (pluginData && pluginData.pulsePeriodMs !== undefined) ? pluginData.pulsePeriodMs : 2000
     readonly property int backstopSeconds: (pluginData && pluginData.backstopSeconds !== undefined) ? pluginData.backstopSeconds : 5
     readonly property bool closeButtonEnabled: (pluginData && pluginData.closeButtonEnabled !== undefined) ? pluginData.closeButtonEnabled : true
+    // Master switch for the visual overlay. When off, the daemon still tracks
+    // VoxType state (so the bar widget's pill stays live) but never shows the
+    // dim/cutout — for users who want only the tray-style widget control.
+    readonly property bool overlayEnabled: (pluginData && pluginData.overlayEnabled !== undefined) ? pluginData.overlayEnabled : true
 
     // ── State ────────────────────────────────────────────────────────────────
     property string statusClass: "idle"
@@ -48,9 +52,14 @@ PluginComponent {
     property bool stateFileLive: false
 
     // Visible while VoxType reports it is capturing or transcribing, unless the
-    // safety backstop has tripped because state went unreadable.
+    // safety backstop has tripped because state went unreadable, or the user has
+    // disabled the visual overlay entirely (widget-only mode).
     readonly property bool recordingActive: statusClass === "recording" || statusClass === "transcribing"
-    readonly property bool active: recordingActive && !backstopTripped
+    readonly property bool active: recordingActive && !backstopTripped && overlayEnabled
+
+    // Publish VoxType's coarse state to a plugin-global var so the bar widget's
+    // pill can reflect it without running its own poll/watch.
+    onStatusClassChanged: if (typeof pluginService !== "undefined" && pluginService) pluginService.setGlobalVar(pluginId, "voxState", statusClass)
 
     // ── Cutout geometry (captured once, at recording start) ──────────────────
     property bool cutValid: false
