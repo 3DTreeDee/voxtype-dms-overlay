@@ -1,0 +1,38 @@
+#!/usr/bin/env sh
+# Surgically set a single `key = "value"` inside a TOML [section] of VoxType's
+# config, preserving comments, formatting, and every other key/section.
+#
+#   voxtype-config-set <section> <key> <value>
+#     e.g.  voxtype-config-set output mode clipboard
+#           voxtype-config-set audio  device alsa_input.usb-...mono-fallback
+#
+# Section-aware (a same-named key in another section is left untouched); if the
+# key is absent it's added to the section; if the section is absent it's created.
+set -eu
+
+SECTION="${1:?usage: voxtype-config-set <section> <key> <value>}"
+KEY="${2:?missing key}"
+VALUE="${3:?missing value}"
+CONFIG="${VOXTYPE_CONFIG:-$HOME/.config/voxtype/config.toml}"
+
+case "$VALUE" in *\"*|*\\*) echo "refusing value with quote/backslash: $VALUE" >&2; exit 2;; esac
+[ -f "$CONFIG" ] || { echo "config not found: $CONFIG" >&2; exit 1; }
+
+tmp="$CONFIG.tmp.$$"
+awk -v section="[$SECTION]" -v key="$KEY" -v value="$VALUE" '
+    function trim(s){ gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); return s }
+    /^[[:space:]]*\[/ {
+        if (insec && !done) { printf "%s = \"%s\"\n", key, value; done=1 }
+        insec = (trim($0) == section) ? 1 : 0
+        print; next
+    }
+    insec && !done && $0 ~ ("^[[:space:]]*" key "[[:space:]]*=") {
+        printf "%s = \"%s\"\n", key, value; done=1; next
+    }
+    { print }
+    END {
+        if (insec && !done) { printf "%s = \"%s\"\n", key, value; done=1 }
+        if (!done)          { printf "\n%s\n%s = \"%s\"\n", section, key, value }
+    }
+' "$CONFIG" > "$tmp"
+mv "$tmp" "$CONFIG"
