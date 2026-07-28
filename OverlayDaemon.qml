@@ -61,6 +61,14 @@ PluginComponent {
     // pill can reflect it without running its own poll/watch.
     onStatusClassChanged: if (typeof pluginService !== "undefined" && pluginService) pluginService.setGlobalVar(pluginId, "voxState", statusClass)
 
+    // Quick-capture flag written by the bar widget via pluginData: "widget" =>
+    // the recording was started from the widget icon, so show a minimal mic-only
+    // overlay (no dim/cutout — there's no meaningful target window when you click
+    // the bar). Empty/absent => full overlay (hotkey/compositor-initiated).
+    // (pluginData is used rather than a PluginGlobalVar because that type isn't
+    // resolvable in a daemon component's context — only in the widget's.)
+    readonly property bool micOnly: recordingActive && pluginData && pluginData.captureMode === "widget"
+
     // ── Cutout geometry (captured once, at recording start) ──────────────────
     property bool cutValid: false
     property string cutMonitorName: ""   // monitor whose active window is cut out
@@ -158,10 +166,15 @@ PluginComponent {
     // recording → transcribing keeps `active` true, the cutout is captured once
     // and preserved through transcription; it is cleared when the overlay hides.
     onActiveChanged: {
-        if (active)
+        if (active) {
             captureCutout();
-        else
+        } else {
             cutValid = false;
+            // Clear the widget quick-capture flag so the next hotkey-initiated
+            // recording gets the full overlay again.
+            if (typeof pluginService !== "undefined" && pluginService && pluginData && pluginData.captureMode === "widget")
+                pluginService.savePluginData(pluginId, "captureMode", "");
+        }
     }
 
     // Fire both hyprctl queries concurrently (they're independent) and apply

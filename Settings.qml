@@ -156,4 +156,33 @@ PluginSettings {
         unit: "s"
         leftIcon: "timer"
     }
+
+    StyledText {
+        width: parent.width
+        text: "Bar widget"
+        font.pixelSize: Theme.fontSizeLarge
+        font.weight: Font.Bold
+        color: Theme.surfaceText
+    }
+
+    ToggleSetting {
+        settingKey: "widgetAutoPaste"
+        label: "Widget capture auto-pastes"
+        description: "Starting a recording from the bar widget shows only a mic (no dim/cutout — there's no target window when you click the bar) and sends text to the clipboard. Enable this to auto-paste it (clipboard + Ctrl+V) instead."
+        defaultValue: false
+    }
+
+    ToggleSetting {
+        settingKey: "engineSwitcherEnabled"
+        label: "Show engine switcher"
+        description: "Show an engine picker in the widget popout, built from your ~/.config/voxtype/use-*.sh preset scripts. Hidden automatically if you have none."
+        defaultValue: true
+    }
+
+    ToggleSetting {
+        settingKey: "meetingEnabled"
+        label: "Meeting controls"
+        description: "Show meeting-mode controls (start / pause / resume / stop, ML diarization, open meetings folder) in the widget popout."
+        defaultValue: false
+    }
 }

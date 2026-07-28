@@ -42,20 +42,23 @@ PanelWindow {
 
     readonly property bool isCutScreen: daemon && daemon.cutValid && win.screen && daemon.cutMonitorName === win.screen.name
     readonly property bool isMicScreen: daemon && win.screen && daemon.micMonitorName === win.screen.name
+    // Mic-only mode (widget quick-capture): show just the pulsing mic, no dim,
+    // no cutout frame, no border.
+    readonly property bool micOnly: daemon ? daemon.micOnly : false
 
     // ── Full-screen dim (non-cutout screens) ─────────────────────────────────
     Rectangle {
         anchors.fill: parent
         color: "black"
         opacity: win.daemon ? win.daemon.dimOpacity : 0
-        visible: !win.isCutScreen
+        visible: !win.isCutScreen && !win.micOnly
     }
 
     // ── Four-rectangle dim frame around the active-window cutout ─────────────
     Item {
         id: frame
         anchors.fill: parent
-        visible: win.isCutScreen
+        visible: win.isCutScreen && !win.micOnly
 
         readonly property int cx: win.daemon ? win.daemon.cutX : 0
         readonly property int cy: win.daemon ? win.daemon.cutY : 0
