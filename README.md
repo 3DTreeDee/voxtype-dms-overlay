@@ -19,10 +19,15 @@ the pill lights up; stop and they clear.
 
 ## Screenshots
 
-<!-- Replace these with real captures before publishing. -->
-| Recording overlay (dim + cutout) | Control popout | Meeting mode |
-|---|---|---|
-| ![Overlay](assets/overlay.png) | ![Popout](assets/popout.png) | ![Meeting](assets/meeting.png) |
+**Recording overlay** — dim + active-window cutout + pulsing mic while dictating:
+
+![Recording overlay](assets/overlay.png)
+
+**Control popout** — daemon control, output / microphone / engine pickers, and
+meeting controls, all from the bar:
+
+<img src="assets/menu.png" alt="Control popout" width="360">
+
 
 ## Features
 
