@@ -1,11 +1,12 @@
 {
   "id": "voxtypeOverlay",
   "name": "VoxType Recording Overlay",
-  "description": "State-reactive full-screen recording overlay for VoxType: dims every monitor, cuts out the active window with a themed highlight border, and shows a pulsing mic while dictation is live.",
+  "description": "VoxType for DankMaterialShell: a state-reactive recording overlay (dims every monitor, cuts out the active window on Hyprland, pulsing mic) plus a bar/tray control widget — start/stop the daemon, switch output mode, pick your microphone, switch engine, and run meetings from your DMS bar.",
   "category": "utilities",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "requires_dms": ">=1.5.0",
   "author": "Robert Dannenbring",
+  "license": "MIT",
   "repo": "https://github.com/rdannenbring/voxtype-dms-overlay",
   "icon": "mic",
   "type": "composite",
@@ -21,15 +22,13 @@
     "ipc"
   ],
   "compositors": [
-    "hyprland"
+    "any"
   ],
   "distro": [
     "any"
   ],
   "dependencies": [
-    "dms",
-    "voxtype",
-    "hyprland"
+    "voxtype"
   ],
   "permissions": [
     "process",

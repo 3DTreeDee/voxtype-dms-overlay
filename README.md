@@ -6,41 +6,66 @@ in two halves you can use together or independently:
 
 - **A recording overlay** — while VoxType is dictating it dims every monitor,
   cuts a clear hole around the window you were focused on (so you can see where
-  your dictated text will land), draws a themed highlight border around it, and
-  shows a pulsing mic. An optional **✕ button** (one per monitor) cancels the
-  current dictation by mouse.
-- **A bar widget** — a tray-style VoxType control that lives in your DMS bar: a
-  status pill (left-click toggles dictation) and a popout to start/stop/restart
-  the daemon, switch output mode, pick your microphone, view logs/config, and
-  toggle the overlay. For DMS users this **replaces the external SNI tray app**.
+  your dictated text will land), draws a themed highlight border, and shows a
+  pulsing mic. An optional **✕ button** (one per monitor) cancels by mouse.
+- **A bar/tray control widget** — a status pill + popout in your DMS bar that
+  **replaces the external SNI tray app**: start/stop/restart the VoxType daemon,
+  switch output mode, pick your microphone, switch engine, and run meetings —
+  all without leaving the bar.
 
-Both are **state-reactive** — the plugin watches VoxType's state file and
-reacts instantly. There's nothing to wire together: start recording and the
-overlay appears and the pill lights up; stop and they clear.
+Both are **state-reactive** — the plugin watches VoxType's state file and reacts
+instantly. Nothing to wire together: start recording and the overlay appears and
+the pill lights up; stop and they clear.
+
+## Screenshots
+
+<!-- Replace these with real captures before publishing. -->
+| Recording overlay (dim + cutout) | Control popout | Meeting mode |
+|---|---|---|
+| ![Overlay](assets/overlay.png) | ![Popout](assets/popout.png) | ![Meeting](assets/meeting.png) |
+
+## Features
+
+- **Full-screen dim + active-window cutout** so you can see where dictated text
+  lands (cutout needs Hyprland; dims everywhere else).
+- **Pulsing mic** indicator with a themeable highlight border and optional label.
+- **Bar pill** that reflects VoxType state live: idle / recording / transcribing
+  / meeting / daemon-stopped, with a pulse while active.
+- **One-click quick capture** — left-click the pill to record to the clipboard
+  (or auto-paste) with a minimal mic-only overlay.
+- **Daemon control** — start / stop / restart `voxtype.service`, open config,
+  view logs.
+- **Output-mode switch** — Active window (type) / Clipboard / Paste.
+- **Microphone picker** — choose the input device by its friendly name.
+- **Engine switcher** — swap engines via your own `use-*.sh` presets.
+- **Meeting controls** — start / pause / resume / stop, ML diarization, open the
+  meetings folder; the pill shows meeting state.
+- **Config-safe** — settings changes edit `config.toml` through a section-aware
+  TOML editor (never a blind append), or use VoxType's CLI directly.
 
 > ## ⚠️ Compatibility — read first
 >
 > - **DankMaterialShell ≥ 1.5.0** — declared via `requires_dms` in `plugin.json`
 >   (the bar-widget + control-center capabilities need 1.5.0). Built and tested
->   on DMS `v1.5.0-134-g069df80b`. It uses DMS's standard plugin API (a
->   `composite` plugin: daemon + widget, `PluginService`, the setting
->   components).
-> - **Hyprland** is required only for the active-window **cutout** (the overlay
->   shells out to `hyprctl`). Your Hyprland config can be the classic `.conf`
->   **or** the new `.lua` — it makes no difference; the plugin never reads your
->   Hyprland config, only the `hyprctl` CLI. Without Hyprland the overlay still
->   dims + shows the mic, just no cutout, and the widget works fully.
+>   on DMS `v1.5.0-134-g069df80b`. It's a `composite` plugin (daemon + widget)
+>   using DMS's standard plugin API.
+> - **Compositor** — the widget and the full-screen dim work on **any** wlroots
+>   compositor. Only the **active-window cutout** is Hyprland-specific (it shells
+>   out to `hyprctl`); without Hyprland the overlay still dims + shows the mic,
+>   just without the cutout. Hyprland's config can be classic `.conf` **or** the
+>   newer `.lua` — the plugin never reads it, only the `hyprctl` CLI.
 
 ## Requirements
 
 - **DankMaterialShell** (Quickshell) ≥ 1.5.0 — see Compatibility above.
-- **VoxType**, installed and running (the `voxtype` daemon, on your `PATH`).
-- **Hyprland** — for the active-window cutout only (any config format).
-- For the **widget's controls** (all optional, degrade gracefully if absent):
-  - a **`voxtype.service`** systemd *user* unit — for start/stop/restart
+- **VoxType**, installed and running (the `voxtype` daemon on your `PATH`).
+- Optional, for individual features (all degrade gracefully if absent):
+  - **Hyprland** — the active-window cutout only;
+  - a **`voxtype.service`** systemd *user* unit — daemon start/stop/restart
     (VoxType's standard install provides this);
-  - **`pactl`** (PipeWire or PulseAudio) — to populate the microphone list;
-  - **`xdg-open`** — for "Open config" / "View logs".
+  - **`pactl`** (PipeWire or PulseAudio) — the microphone picker;
+  - **`xdg-open`** — "Open config" / "View logs" / "Open meetings folder";
+  - `~/.config/voxtype/use-*.sh` preset scripts — the engine switcher.
 
 ## Install
 
@@ -49,8 +74,8 @@ git clone https://github.com/rdannenbring/voxtype-dms-overlay ~/Development/voxt
 ln -sfn ~/Development/voxtype-dms-overlay ~/.config/DankMaterialShell/plugins/voxtypeOverlay
 ```
 
-Then enable it in **DMS Settings → Plugins → VoxType Recording Overlay**, and
-add the pill to your bar in **Settings → Dank Bar** (look for *VoxType*).
+Then enable it in **DMS Settings → Plugins → VoxType Recording Overlay**, and add
+the pill to your bar in **Settings → Dank Bar** (look for *VoxType*).
 
 > Editing the plugin later? Edits to existing QML files hot-reload via the **↻
 > refresh icon** in Settings → Plugins, or `dms ipc call plugins reload
@@ -60,7 +85,7 @@ add the pill to your bar in **Settings → Dank Bar** (look for *VoxType*).
 
 ## Using it
 
-### Trigger recording (drives the overlay + pill)
+### Trigger recording
 
 Any way of starting VoxType works — the plugin just reacts:
 
@@ -72,33 +97,57 @@ Any way of starting VoxType works — the plugin just reacts:
   ```
   (Hyprland's newer `.lua` config works too. If you use a compositor bind,
   disable the built-in one: `[hotkey] enabled = false`.)
-- **The bar widget** — left-click the pill, or "Toggle recording" in its popout.
+- **The bar pill** — left-click (see *Quick capture* below).
 
-### The bar widget
+Recording started by hotkey/keybind gets the **full overlay** (dim + cutout) and
+uses your configured output mode.
 
-- **Pill** — the mic icon reflects VoxType's state: `mic` when idle, **pulsing**
-  while recording, `graphic_eq` while transcribing, `mic_off` (in the error
-  colour) when the daemon isn't running. **Left-click** toggles dictation;
-  **right- or middle-click** opens the control popout.
-- **Popout** —
-  - **Toggle recording**
-  - **Start / Stop / Restart daemon** (`voxtype.service`)
-  - **Open config** (`config.toml` in your default editor) · **View logs**
-  - **Output** — switch `[output] mode` between *Active window* (type) /
-    *Clipboard* / *Paste*
-  - **Mic** — pick the `[audio] device` from your input sources (shown by
-    PipeWire description, e.g. "Jabra Engage 75 Mono")
-  - **Recording overlay** — master on/off for the visual overlay (below)
+### The bar pill
 
-Changing the output mode or microphone edits `config.toml` and restarts the
-VoxType daemon so the change takes effect (a brief model-reload pause).
+The pill's icon reflects VoxType's state and pulses while active:
+
+| State | Icon |
+|---|---|
+| Idle | `mic` |
+| Recording | `mic` (pulsing) |
+| Transcribing | `graphic_eq` |
+| Meeting starting | `pending` |
+| Meeting running / paused | `groups` (pulsing while running) |
+| Daemon not running | `mic_off` |
+
+- **Left-click** — quick capture, or (during a meeting) a focused pause/stop
+  dropdown.
+- **Right- or middle-click** — the full control popout.
+
+### Quick capture (left-click)
+
+Clicking the pill starts a recording with a **mic-only overlay** (no dim/cutout —
+there's no target window when your focus is the bar) and sends the transcript to
+the **clipboard** by default, or **auto-pastes** it if you enable *Widget capture
+auto-pastes* in settings. Click again to stop.
+
+### The control popout (right/middle-click)
+
+- **Toggle recording**
+- **Start / Stop / Restart daemon** (`voxtype.service`)
+- **Open config** · **View logs**
+- **Output** — switch `[output] mode`: Active window / Clipboard / Paste
+- **Mic** — pick the `[audio] device` by friendly name (e.g. "Jabra Engage 75
+  Mono"); monitors are filtered out
+- **Engine** *(if `~/.config/voxtype/use-*.sh` presets exist)* — run a preset
+- **Meeting** *(if enabled in settings)* — Start / Start (ML diarization) /
+  Pause / Resume / Stop / Open meetings folder
+- **Recording overlay** — master on/off for the visual overlay
+
+Output-mode and mic changes edit `config.toml` (via the section-aware editor) and
+restart the daemon so the change takes effect — a brief model-reload pause.
 
 ### Overlay-only or widget-only
 
-- Want **only the bar control**, no full-screen dim? Turn **Recording overlay**
-  off (in the popout or Settings). The daemon still tracks state — the pill
-  stays live — but no dim/cutout is drawn.
-- Want **only the overlay**? Just don't add the pill to your bar.
+- **Only the bar control**, no full-screen dim? Turn **Recording overlay** off
+  (popout or Settings). The daemon still tracks state — the pill stays live — but
+  no dim/cutout is drawn.
+- **Only the overlay**? Just don't add the pill to your bar.
 
 ### Audio feedback (optional)
 
@@ -106,6 +155,8 @@ The overlay is **pure-visual**. For start/stop beeps, use VoxType's own
 `[audio.feedback]` in `config.toml` — no extra tooling required.
 
 ## Settings (Settings → Plugins → VoxType Recording Overlay)
+
+**Overlay**
 
 | Setting | Key | Default |
 |---|---|---|
@@ -125,36 +176,42 @@ The overlay is **pure-visual**. For start/stop beeps, use VoxType's own
 | Close button (✕) | `closeButtonEnabled` | on |
 | Safety auto-hide | `backstopSeconds` | 5s |
 
+**Bar widget**
+
+| Setting | Key | Default |
+|---|---|---|
+| Widget capture auto-pastes | `widgetAutoPaste` | off (clipboard) |
+| Show engine switcher | `engineSwitcherEnabled` | on |
+| Meeting controls | `meetingEnabled` | off |
+
 All settings apply live — no restart required.
 
 ## How it works
 
-This is a DMS **`composite`** plugin: one `plugin.json`, two components that
-share state.
+A DMS **`composite`** plugin: one `plugin.json`, two components sharing state.
 
-- **`OverlayDaemon.qml`** — the single daemon coordinator. Detection is
-  **event-driven**: a `FileView` watches VoxType's state file
-  (`$XDG_RUNTIME_DIR/voxtype/state`) and reacts on the inotify change, so the
-  overlay/pill appear the moment VoxType flips to `recording` — no polling
-  latency. A slow `voxtype status` poll remains as a backstop (liveness +
-  hide-if-unreadable failsafe + fallback when the state file is absent). On the
-  rising edge it captures the active-window rect once (`hyprctl activewindow -j`
-  + `hyprctl monitors -j`, run concurrently) and drives one overlay window per
-  monitor. It publishes VoxType's state to a plugin global var (`voxState`) so
-  the widget's pill reflects it for free.
-- **`OverlayWindow.qml`** — one `WlrLayershell.Overlay` `PanelWindow` per
-  screen. The monitor with the active window draws a four-rectangle dim "frame"
-  leaving the window clear (no shaders/masks) plus a highlight border; other
-  monitors dim fully. The focused monitor shows the pulsing mic + label and (if
-  enabled) the ✕ button. The surface is click-through **except** the ✕ — its
-  input `mask` is just that button's rect — so a stray click passes through and
-  recording never traps the pointer.
+- **`OverlayDaemon.qml`** — the coordinator. Detection is **event-driven**: a
+  `FileView` watches VoxType's state file (`$XDG_RUNTIME_DIR/voxtype/state`) and
+  reacts on the inotify change, so the overlay/pill appear the instant VoxType
+  flips to `recording` — no polling latency. A slow `voxtype status` poll remains
+  as a backstop (liveness + hide-if-unreadable failsafe + fallback when the state
+  file is absent). On the rising edge it captures the active-window rect once
+  (`hyprctl activewindow -j` + `hyprctl monitors -j`, run concurrently) and drives
+  one overlay window per monitor. It publishes state to a plugin global var
+  (`voxState`) for the pill, and reads `pluginData.captureMode` to render the
+  mic-only quick-capture overlay.
+- **`OverlayWindow.qml`** — one `WlrLayershell.Overlay` `PanelWindow` per screen.
+  The monitor with the active window draws a four-rectangle dim "frame" leaving
+  the window clear (no shaders/masks) plus a highlight border; other monitors dim
+  fully. The focused monitor shows the pulsing mic + label and (if enabled) the ✕
+  button. The surface is click-through **except** the ✕.
 - **`VoxTypeWidget.qml`** — the bar pill + control popout. Simple actions are
-  fire-and-forget (`voxtype record toggle`, `systemctl --user … voxtype.service`).
-  Output-mode and mic changes go through **`scripts/voxtype-config-set`**, a
-  section-aware POSIX `sh` + `awk` editor that replaces a key's value **in
-  place** within its `[section]` (adding the key or section if missing),
-  preserving all comments and other settings — never a blind append.
+  fire-and-forget (`voxtype record toggle`, `systemctl --user … voxtype.service`,
+  `voxtype meeting …`). Output-mode and mic changes go through
+  **`scripts/voxtype-config-set`**, a section-aware POSIX `sh` + `awk` editor that
+  replaces a key's value **in place** within its `[section]` (adding the key or
+  section if missing), preserving all comments and other settings — never a blind
+  append.
 - **Teardown** is declarative: each overlay window's `visible` is bound to
   `active`, so Quickshell destroys the layer surface the instant recording ends
   or the plugin is disabled. Verify no leaks:
@@ -165,15 +222,17 @@ share state.
 ## Not in this plugin (by design)
 
 - **Audio** (beeps/ducking) — use VoxType's own `[audio.feedback]`.
-- **Engine switching** and **meeting mode** — not (yet) surfaced in the widget.
+- **Recent-meetings browser** (show/summarize/export/delete per past meeting) —
+  the widget covers live meeting *control*; browsing past meetings is a possible
+  follow-up.
 - VoxType's built-in **OSD** waveform sync — deferred to a possible follow-up.
 
 ---
 
 ## Related VoxType tooling (optional)
 
-The bar widget above **supersedes the standalone SNI tray app for DMS users**.
-These portable, cross-desktop tools remain for non-DMS setups:
+The bar widget **supersedes the standalone SNI tray app for DMS users**. These
+portable, cross-desktop tools remain for non-DMS setups:
 
 - [voxtype-hyprland-overlay](https://github.com/rdannenbring/voxtype-hyprland-overlay)
   — a standalone GTK4 recording overlay for any wlroots compositor. If you run
@@ -182,3 +241,7 @@ These portable, cross-desktop tools remain for non-DMS setups:
 - [voxtype-hyprland-overlay-tray](https://github.com/rdannenbring/voxtype-hyprland-overlay-tray)
   — a system-tray controller for any SNI bar (Waybar, KDE, …), for desktops
   without the DMS bar.
+
+## License
+
+MIT
