@@ -69,8 +69,8 @@ voxtype-dms-overlay/
 
 ## Milestones
 
-1. **[ ] Repo fork + rama feature + esta spec** — hecho.
-2. **[ ] Helper Python del auditor** (observar transcript, KB, IA fallback) + CLI.
+1. **[x] Repo fork + rama feature + esta spec** — hecho (fork 3DTreeDee/voxtype-dms-overlay).
+2. **[x] Helper Python del auditor** (observar transcript, KB, IA fallback) + CLI — hecho (`audit/auditor.py` watch/replay/listen, `kb_index.py`, `omniroute_client.py`).
 3. **[ ] Integración QML**: switch + overlay del auditor en vivo (daemon).
 4. **[ ] UI de config** (API keys, modelos/combos, umbral, KB paths).
 5. **[ ] Prueba con reunión real (ambos lados).**
