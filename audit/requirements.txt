@@ -1,0 +1,7 @@
+# Auditor de reuniones — dependencias Python (auxiliar para el helper)
+# Si usas el plugin sin el auditor, no necesitas estas.
+sentence-transformers>=2.2.0
+numpy>=1.24
+aiohttp>=3.8
+PyYAML>=6.0
+# torch lo instala sentence-transformers automáticamente (CPU basta para 384-dim)
