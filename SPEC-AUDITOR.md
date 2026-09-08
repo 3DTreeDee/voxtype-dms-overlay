@@ -75,3 +75,14 @@ voxtype-dms-overlay/
 4. **[ ] UI de config** (API keys, modelos/combos, umbral, KB paths).
 5. **[ ] Prueba con reunión real (ambos lados).**
 6. **[ ] Portar/empaquetar para otros equipos.**
+
+## Modelos por modo (feature)
+
+voxtype **no** soporta nativamente modelos distintos para hotkey vs meetings. Implementamos **swap automático** en el fork:
+
+- **Modo dictado** → modelo **`small`** (ligero, rápido, interactivo).
+- **Modo reuniones** → modelo **`large-v3-turbo`** (≈ precisión de large-v3 pero ~8× más rápido; destilado). VRAM ~2 GB, solo reside mientras grabas (on-demand).
+- **Flujo**: al iniciar reunión el daemon llama `scripts/voxtype-model-swap.sh reunion` (swap + restart); al terminar, `revert` (vuelve al previo/small).
+- **Configurable desde la interfaz** (Settings): campos `modelo_dictado` y `modelo_reuniones`, toggle `swap_auto`.
+- Script: `scripts/voxtype-model-swap.sh {dictado|reunion|revert|status}`, sobreescribible vía `VOXTYPE_MODEL_DICTADO`/`VOXTYPE_MODEL_REUNION`.
+- Documentado en spec. [x] script implementado y probado (guardado de estado). Pendiente: integración en daemon (milestone 3).
