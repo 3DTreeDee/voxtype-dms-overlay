@@ -448,35 +448,41 @@ class MeetingAuditor:
                     })
             await asyncio.sleep(poll_interval)
 
-    # -- Capture en vivo: grabar mic + loopback y transcribir con voxtype --
-    async def capture_live(self, chunk_secs: float = 6.0,
-                           mic_source: Optional[str] = None,
+    # -- Capture en vivo (Fase 6): frases por VAD + whisper-server persistente --
+    async def capture_live(self, mic_source: Optional[str] = None,
                            loop_source: Optional[str] = None,
-                           vad_threshold: float = 0.003) -> None:
-        """Feed 100% en vivo: captura audio (mic → You, loopback → Remote),
-        transcribe cada chunk con `voxtype transcribe` (modelo residente en el
-        daemon de voxtype) y procesa los enunciados con KB/IA (según
-        auto_reply). Además, acepta comandos de push-to-ask desde un archivo
-        de señal (Fase 4): ask_start → ask_end → graba audio aparte,
-        transcribe y envía a la IA con contexto de los últimos captions."""
+                           vad_threshold: float = 0.003,
+                           min_silence_secs: float = 0.8,
+                           max_phrase_secs: float = 15.0,
+                           whisper_url: Optional[str] = None) -> None:
+        """Feed en vivo por FRASES (Fase 6): captura continua (mic → You,
+        loopback → Remote) con corte por fin-de-frase (VAD), transcribe cada
+        frase con el whisper-server HTTP persistente (modelo caliente en VRAM,
+        ~0.4-0.7s/frase) y emite captions. Push-to-ask (Fase 4) intacto: señal
+        ask_start/ask_end → graba aparte → transcribe (whisper-server) → IA
+        con contexto de los últimos captions."""
         from audio_capture import LiveCapture, _default_mic_source, _default_loopback_source
 
-        voxtype_bin = self._resolve_voxtype()
-        if not voxtype_bin:
-            log.error("voxtype no está en PATH; el modo capture lo necesita")
-            emit({"type": "ai_error", "speaker": "you", "text": "",
-                  "error": "voxtype CLI no encontrado en PATH"})
-            return
+        # Motor de transcripción: whisper-server persistente. Si no puede
+        # arrancar, caemos a `voxtype transcribe` (lento pero funcional).
+        whisper = WhisperHTTP(url=whisper_url)
+        ok = await whisper.ensure()
+        if not ok:
+            log.warning("whisper-server no disponible — usando voxtype transcribe (lento)")
+            emit({"type": "info",
+                  "msg": "⚠️ Motor whisper-server no disponible; usando voxtype (más lento)"})
+        self._whisper = whisper
+        self._transcribe_engine = whisper if ok else None
 
-        cap = LiveCapture(chunk_secs=chunk_secs,
-                          mic_source=mic_source or _default_mic_source(),
+        cap = LiveCapture(mic_source=mic_source or _default_mic_source(),
                           loop_source=loop_source or _default_loopback_source(),
-                          vad_threshold=vad_threshold)
+                          vad_threshold=vad_threshold,
+                          min_silence_secs=min_silence_secs,
+                          max_phrase_secs=max_phrase_secs)
         await cap.start()
 
-        log.info(f"Capture en vivo activo (chunk={chunk_secs}s, umbral VAD={vad_threshold})")
-        transcribe_tasks: Dict[str, asyncio.Task] = {}
-        last_finish: Dict[str, float] = {}   # dedupe: texto repetido en <2 chunks
+        log.info(f"Capture por frases activo (silencio≥{min_silence_secs}s, "
+                 f"tope={max_phrase_secs}s, umbral VAD={vad_threshold})")
 
         # ── Push-to-ask (Fase 4) ────────────────────────────────────────────
         ask_dir = cap.tmp_dir
@@ -555,7 +561,7 @@ class MeetingAuditor:
             for tag, wav in self._ask_wavs.items():
                 if wav and wav.exists() and wav.stat().st_size > 2000:
                     try:
-                        text = await self._transcribe_wav(voxtype_bin, wav)
+                        text = await self._ask_transcribe(wav)
                         if text and text.strip():
                             if tag == "mic":
                                 mic_text = text.strip()
@@ -623,35 +629,58 @@ class MeetingAuditor:
         # Arrancar vigía de comandos push-to-ask en paralelo
         ask_watcher = asyncio.create_task(_watch_ask_commands())
 
-        self._voxtype_bin = voxtype_bin  # guardar para re-uso en ask
+        async def _ask_transcribe(wav: Path) -> str:
+            """Transcribe un WAV con el motor activo (whisper-server o voxtype)."""
+            if self._transcribe_engine is not None:
+                return await self._transcribe_engine.transcribe(wav)
+            vb = self._resolve_voxtype()
+            if vb:
+                return await self._transcribe_wav(vb, wav)
+            return ""
+
+        # helper de transcripción compartido por captions y push-to-ask
+        async def _transcribe(wav: Path, side: str, speaker_raw: str) -> None:
+            try:
+                if self._transcribe_engine is not None:
+                    text = await self._transcribe_engine.transcribe(wav)
+                else:
+                    vb = self._resolve_voxtype()
+                    if not vb:
+                        return
+                    text = await self._transcribe_wav(vb, wav)
+            except Exception as e:
+                log.warning(f"Transcripción falló: {e}")
+                return
+            text = (text or "").strip()
+            if not text or len(text) < 2:
+                return
+            log.info(f"[{side}] {text[:100]}")
+            await self.process_utterance({
+                "speaker": side,
+                "speaker_raw": speaker_raw,
+                "text": text,
+                "ts": int(time.time() * 1000),
+            })
 
         try:
             while True:
                 chunk = await cap.next_chunk()
                 if chunk is None:
                     break
-                # Lanzar transcripción de mic y loop en paralelo
+                # Transcribir los lados con frase cerrada en paralelo
+                tasks = []
                 if chunk.mic_wav is not None:
-                    transcribe_tasks["you"] = asyncio.create_task(
-                        self._transcribe_and_process(
-                            voxtype_bin, chunk.mic_wav, "you", "You", last_finish))
+                    tasks.append(asyncio.create_task(
+                        _transcribe(chunk.mic_wav, "you", "You")))
                 if chunk.loop_wav is not None:
-                    transcribe_tasks["remote"] = asyncio.create_task(
-                        self._transcribe_and_process(
-                            voxtype_bin, chunk.loop_wav, "remote", "Remote", last_finish))
-                # Esperar a que terminen antes del siguiente chunk (evita GPU saturada)
-                if transcribe_tasks:
-                    done, pending = await asyncio.wait(
-                        transcribe_tasks.values(), timeout=chunk_secs + 20)
-                    for t in pending:
-                        t.cancel()
-                    transcribe_tasks = {k: v for k, v in transcribe_tasks.items()
-                                        if not v.done()}
-                    # limpiar tasks completadas
-                    transcribe_tasks = {}
+                    tasks.append(asyncio.create_task(
+                        _transcribe(chunk.loop_wav, "remote", "Remote")))
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             ask_watcher.cancel()
             await cap.stop()
+            await whisper.close()
 
     # -- Live meeting: captions rápidos desde transcript.json de voxtype --
     async def live_meeting(self, transcript_path: Optional[Path] = None,
@@ -812,35 +841,6 @@ class MeetingAuditor:
                 return cand
         return None
 
-    async def _transcribe_and_process(self, voxtype_bin: str, wav: Path,
-                                      side: str, speaker_raw: str,
-                                      last_finish: Dict[str, float]) -> None:
-        """Transcribe un WAV con `voxtype transcribe` y procesa el enunciado."""
-        try:
-            text = await self._transcribe_wav(voxtype_bin, wav)
-        except Exception as e:
-            log.warning(f"Transcripción falló: {e}")
-            return
-        text = (text or "").strip()
-        if not text or len(text) < 2:
-            return
-        # Dedupe: mismo texto terminado hace <2*chunk (evita repetir por solape)
-        now = time.time()
-        if last_finish.get(side) and now - last_finish[side] < self.chunk_dedupe_secs:
-            return
-        last_finish[side] = now
-        log.info(f"[{side}] {text[:100]}")
-        await self.process_utterance({
-            "speaker": side,
-            "speaker_raw": speaker_raw,
-            "text": text,
-            "ts": int(now * 1000),
-        })
-
-    @property
-    def chunk_dedupe_secs(self) -> float:
-        return getattr(self, "_chunk_dedupe_secs", 8.0)
-
     async def _transcribe_wav(self, voxtype_bin: str, wav: Path) -> str:
         """Invoca `voxtype transcribe <wav>`; devuelve el texto transcrito.
 
@@ -866,6 +866,147 @@ class MeetingAuditor:
 
 
 # ---------------------------------------------------------------------------
+# Motor de transcripción Fase 6: whisper-server HTTP persistente (Vulkan)
+# ---------------------------------------------------------------------------
+# whisper.cpp compilado con GGML_VULKAN=ON trae `whisper-server`: carga el
+# modelo ggml-large-v3-turbo UNA vez en VRAM (~1.6GB) y responde en
+# ~400-660ms por transcripción con modelo caliente (vs ~4.3s de `voxtype
+# transcribe` que recarga el modelo por invocación). Instalado en
+# ~/.local/share/whisper-cpp/ (cmake --install). El rpath queda vacío al
+# instalar → lanzar con LD_LIBRARY_PATH apuntando a su lib/.
+
+
+class WhisperHTTP:
+    """Cliente + ciclo de vida del whisper-server.
+
+    - ensure(): health check; si no responde, lo arranca y espera a que
+      cargue el modelo (hasta ~25s). Reutiliza un server ya activo (p.ej. el
+      que dejó corriendo otra reunión).
+    - transcribe(wav): POST /inference (multipart) → texto.
+    - close(): cierra sesión HTTP y mata el server SOLO si este objeto lo
+      arrancó (un server ajeno se deja vivo).
+
+    Configurable por env:
+      AUDITOR_WHISPER_URL    (default http://127.0.0.1:8177)
+      AUDITOR_WHISPER_BIN    (default ~/.local/share/whisper-cpp/bin/whisper-server)
+      AUDITOR_WHISPER_MODEL  (default ~/.local/share/voxtype/models/ggml-large-v3-turbo.bin)
+      AUDITOR_WHISPER_LANG   (default '' → auto-detección ES/EN por whisper)
+    """
+
+    def __init__(self, url: Optional[str] = None):
+        self.url = (url or os.environ.get("AUDITOR_WHISPER_URL")
+                    or "http://127.0.0.1:8177").rstrip("/")
+        self.lang = os.environ.get("AUDITOR_WHISPER_LANG", "").strip()
+        home = str(Path.home())
+        self.bin = (os.environ.get("AUDITOR_WHISPER_BIN")
+                    or f"{home}/.local/share/whisper-cpp/bin/whisper-server")
+        self.model = (os.environ.get("AUDITOR_WHISPER_MODEL")
+                      or f"{home}/.local/share/voxtype/models/ggml-large-v3-turbo.bin")
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._owned = False
+        self._session: Optional[object] = None
+        self._port = 8177
+        try:
+            self._port = int(self.url.rsplit(":", 1)[1].rstrip("/"))
+        except Exception:
+            pass
+
+    async def _http(self):
+        if self._session is None:
+            import aiohttp
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def health(self) -> bool:
+        try:
+            s = await self._http()
+            async with s.get(f"{self.url}/health", timeout=3) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    async def ensure(self) -> bool:
+        """Garantiza un whisper-server respondiendo en self.url."""
+        if await self.health():
+            log.info(f"whisper-server ya activo en {self.url}")
+            return True
+        if not os.path.exists(self.bin):
+            log.error(f"whisper-server no encontrado: {self.bin}")
+            return False
+        if not os.path.exists(self.model):
+            log.error(f"modelo whisper no encontrado: {self.model}")
+            return False
+        log.info(f"Arrancando whisper-server (Vulkan): {self.bin}")
+        libdir = os.path.join(os.path.dirname(self.bin), "..", "lib")
+        env = os.environ.copy()
+        prev = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{libdir}:{prev}" if prev else libdir
+        cmd = [self.bin, "-m", self.model, "--host", "127.0.0.1",
+               "--port", str(self._port), "-t", "4", "--convert"]
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT, env=env)
+            self._owned = True
+        except Exception as e:
+            log.error(f"fallo al arrancar whisper-server: {e}")
+            return False
+        # Esperar a que cargue el modelo (~2.7s) y responda /health
+        for _ in range(80):  # 80 × 300ms = 24s máx
+            if self._proc.returncode is not None:
+                log.error("whisper-server murió al arrancar")
+                return False
+            if await self.health():
+                log.info("whisper-server listo (modelo en VRAM)")
+                return True
+            await asyncio.sleep(0.3)
+        log.error("whisper-server no respondió a /health a tiempo")
+        return False
+
+    async def transcribe(self, wav: Path) -> str:
+        """POST /inference → texto transcrito ('' si falla o no hay voz)."""
+        import aiohttp
+
+        s = await self._http()
+        try:
+            form = aiohttp.FormData()
+            form.add_field("file", open(wav, "rb"), filename=wav.name,
+                           content_type="audio/wav")
+            if self.lang:
+                form.add_field("language", self.lang)
+            async with s.post(f"{self.url}/inference", data=form,
+                              timeout=30) as r:
+                if r.status != 200:
+                    log.warning(f"whisper-server HTTP {r.status}")
+                    return ""
+                data = await r.json()
+        except Exception as e:
+            log.warning(f"whisper-server transcribe error: {e}")
+            return ""
+        text = (data or {}).get("text", "") or ""
+        return text.strip()
+
+    async def close(self) -> None:
+        if self._session is not None:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
+        if self._owned and self._proc is not None:
+            try:
+                self._proc.terminate()
+                await asyncio.wait_for(self._proc.wait(), timeout=3)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._owned = False
+            self._proc = None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 async def main():
@@ -884,11 +1025,16 @@ async def main():
                               help="Path opcional a un transcript.json concreto")
     p_watch_json.add_argument("--poll", type=float, default=1.0)
 
-    p_capture = sub.add_parser("capture", help="Captura audio en vivo (mic+loopback) y transcribe con voxtype (feed 100% en vivo)")
-    p_capture.add_argument("--chunk-secs", type=float, default=6.0)
+    p_capture = sub.add_parser("capture", help="Captura audio en vivo (mic+loopback) por fin-de-frase y transcribe con whisper-server (feed en vivo)")
     p_capture.add_argument("--mic-source", default=None, help="Source PipeWire del mic (default: source del sistema)")
     p_capture.add_argument("--loop-source", default=None, help="Monitor del sink (default: monitor del sink por defecto)")
     p_capture.add_argument("--vad-threshold", type=float, default=0.003)
+    p_capture.add_argument("--min-silence-secs", type=float, default=0.8,
+                           help="Silencio sostenido que cierra una frase (default 0.8s)")
+    p_capture.add_argument("--max-phrase-secs", type=float, default=15.0,
+                           help="Tope de duración por frase (default 15s)")
+    p_capture.add_argument("--whisper-url", default=None,
+                           help="URL del whisper-server (default env AUDITOR_WHISPER_URL o http://127.0.0.1:8177)")
 
     p_live = sub.add_parser("live", help="Modo reunión en vivo: lee transcript.json de voxtype (captions rápidos ~2-3s) + push-to-ask")
     p_live.add_argument("transcript", nargs="?", default=None,
@@ -952,10 +1098,12 @@ async def main():
     elif args.cmd == "capture":
         async with OmniRouteClient(ai_cfg) as ai:
             auditor.ai = ai
-            await auditor.capture_live(chunk_secs=args.chunk_secs,
-                                       mic_source=args.mic_source,
+            await auditor.capture_live(mic_source=args.mic_source,
                                        loop_source=args.loop_source,
-                                       vad_threshold=args.vad_threshold)
+                                       vad_threshold=args.vad_threshold,
+                                       min_silence_secs=args.min_silence_secs,
+                                       max_phrase_secs=args.max_phrase_secs,
+                                       whisper_url=args.whisper_url)
     elif args.cmd == "live":
         async with OmniRouteClient(ai_cfg) as ai:
             auditor.ai = ai

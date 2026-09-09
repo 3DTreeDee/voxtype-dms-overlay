@@ -335,18 +335,21 @@ PluginComponent {
             Proc.runCommand("voxtypeOverlay.swapMeeting", swapCmd, (stdout, exitCode) => {}, 0);
         }
 
-        // 2) Arrancar voxtype meeting (transcripción continua → transcript.json)
+        // 2) Arrancar voxtype meeting (grabación COMPLETA de respaldo → transcript.json
+        //    al hacer stop; es la que se exporta/indexa para RAG)
         Proc.runCommand("voxtypeOverlay.startMeeting", ["voxtype", "meeting", "start"],
             (stdout, exitCode) => {}, 0, 10000);
 
-        // 3) Esperar ~2s a que transcript.json se cree, luego lanzar auditor en modo live
+        // 3) Esperar ~2s, luego lanzar el auditor en modo capture (Fase 6):
+        //    captions por fin-de-frase vía whisper-server HTTP persistente
+        //    (el propio auditor arranca whisper-server si no está corriendo).
         Qt.callLater(() => {
             Qt.callLater(() => {
                 auditorThread.stop();
                 let args = [root.auditorScript()];
                 if (root.auditorVault !== "")
                     args = args.concat(["--vault", root.auditorVault]);
-                args = args.concat(["live"]);
+                args = args.concat(["capture"]);
                 auditorThread.commandModel = args;
                 auditorThread.start();
             });

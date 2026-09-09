@@ -9,7 +9,10 @@
 - **Fase 2** ✅ Dropdown dinámico de modelos tras check exitoso ✓ (commit `cdbb32b`)
 - **Fase 3** ✅ Toggle respuestas automáticas / captions-only ✓ (commit `dc0cb03`)
 - **Fase 4** ✅ Push‑to‑ask con botón en panel ✓ (commit `6d5ebc9`)
-- **Fase 5** ⬜ Pulido y registro
+- **Fase 5** ✅ Captions rápidos + RAG inteligente ✓ (commit `11d8845`)
+- **Fase 6** 🚧 Motor de transcripción persistente whisper.cpp+Vulkan (reemplaza
+  `voxtype transcribe`) + captura por fin-de-frase con VAD — arquitectura
+  aprobada por el usuario (2026-09-09)
 
 ## Visión
 
@@ -84,6 +87,54 @@ Nuevo comportamiento:
 - **Prueba**: sostener tecla → hablar pregunta → soltar → respuesta con
   fuentes del vault en <10s.
 
+### Fase 6 — Motor persistente whisper.cpp+Vulkan + captura por fin-de-frase
+
+**Problema que resuelve**: `voxtype transcribe` (motor del `capture` en Fases 3-5)
+recarga el modelo GGML en cada invocación (~2.7s de carga + ~1.5s de inferencia
+≈ 4.3s/caption — benchmark 2026-09-09) → impracticable para captions en vivo.
+
+**Motor elegido (validado con voz real del usuario)**:
+
+- **whisper.cpp compilado desde fuente con `GGML_VULKAN=ON`** → usa la AMD
+  RX 6650 XT (RADV NAVI23): encode 380ms vs 10,700ms CPU (28×).
+- **`whisper-server`** (daemon HTTP que viene con whisper.cpp): carga el modelo
+  `ggml-large-v3-turbo.bin` UNA vez en VRAM (~2.7s al arrancar, 1.6GB en
+  Vulkan0) y responde en **~400-660ms por transcripción** con modelo caliente.
+  Endpoint: `POST /inference` (multipart) + `GET /health`.
+- Instalado en `~/.local/share/whisper-cpp/` (`cmake --install`, rpath vacío →
+  lanzar con `LD_LIBRARY_PATH=.../lib`).
+- Mismo modelo large-v3-turbo que ya usa voxtype → **fiabilidad y puntuación
+  idénticas a lo conocido** (decisión: fiabilidad pesa más que velocidad).
+
+**Captura por fin-de-frase (VAD), no chunks fijos**: en vez de grabar 2s y
+transcribir, la captura corre **pw-record continuo por lado** (mic → You,
+loopback → Remote) y un lector detecta silencio sostenido (~0.8s) tras voz →
+cierra la frase y la envía a transcribir. Latencia percibida: **fin de frase
++ ~0.5-1s** (en vez de 2s fijos de chunk). Frases largas (≥15s) se cortan por
+timeout para no perder audio.
+
+**Por qué NO parakeet.cpp streaming** (evaluado 2026-09-09, descartado):
+- `parakeet_realtime_eou_120m-v1` (el modelo streaming de parakeet.cpp): solo
+  inglés, sin puntuación ni mayúsculas, WER alto (modelo 5× menor).
+- `nemotron-3.5-asr-streaming-0.6b` (multilingüe): habría que validarlo; la
+  ganancia vs whisper-server es ~0.5s de latencia a cambio de fiabilidad
+  desconocida — contrario a la prioridad del usuario.
+
+**Cambios en el código**:
+- `audio_capture.py`: `LiveCapture` pasa de chunks de duración fija a captura
+  continua + corte por fin-de-frase (VAD por RMS, sin solape perdido).
+- `auditor.py`: nuevo motor `_transcribe_wav_http` (POST al whisper-server vía
+  aiohttp); `capture_live` arranca el daemon si no responde en el puerto
+  (health check) y lo usa para captions Y push-to-ask. Fallback: `voxtype
+  transcribe` si el server no puede arrancar.
+- `OverlayDaemon.qml`: `startAuditor` lanza el auditor en modo `capture`
+  (en vez de `live`), manteniendo `voxtype meeting start` como grabación
+  completa de respaldo (la que se exporta/indexa para RAG).
+
+**Prueba**: reunión real → el feed muestra captions por frase en ~1s tras
+callar, con puntuación y ES/EN; `voxtype meeting stop` sigue exportando la
+transcripción completa.
+
 ### Fase 5 — Pulido y registro
 - Persistencia del transcript de captions (ya existe naming único por chunk).
 - Ajustes de prompt (idioma, longitud máx, nº de captions de contexto).
@@ -110,18 +161,32 @@ Nuevo comportamiento:
 
 ## Riesgos y mitigaciones
 
-- **Latencia al soltar la tecla**: transcribir (~1s) + IA (~4-6s) → respuesta
-  en ~6-8s. Mitigar: estado "pensando…" visible, y si hace falta streaming.
+- **Latencia al soltar la tecla**: transcribir (~0.5s con whisper-server) + IA
+  (~4-6s) → respuesta en ~5-7s. Mitigar: estado "pensando…" visible, y si hace
+  falta streaming.
+- **whisper-server no está corriendo al iniciar reunión**: `capture_live` hace
+  health check y lo arranca él mismo (carga del modelo ~2.7s → primera caption
+  tarda ~3-4s; aceptable, nadie habla en el segundo 0 y voxtype meeting ya
+  graba el respaldo completo). Al salir, lo detiene si él lo lanzó.
 - **Preguntas de la persona Remota**: con push-to-ask el usuario repite la
   pregunta (o se captura por loopback si el remoto habla durante la
   pulsación). Confirmar si esto cubre el caso de uso.
 - **No romper dictado normal**: ScrollLock dictado coexiste; el modo auditor
-  es solo durante reunión activa.
+  es solo durante reunión activa. whisper-server ocupa ~1.6GB de VRAM solo
+  durante la reunión (se cierra al salir).
+- **VRAM 8GB**: si `voxtype meeting start` corre en paralelo, voxtype usa su
+  propia gestión (Whisper/Parakeet). whisper-server comparte GPU vía Vulkan;
+  si hubiera contención, voxtype queda configurado para CPU + diarización
+  simple (tradeoff aceptado).
 
 ## Referencia de arquitectura (sin cambios de diseño)
 
-- audio_capture.py (chunks únicos, VAD RMS ≥0.003, dedupe SHA256)
+- audio_capture.py (captura continua, corte por fin-de-frase: VAD RMS ≥0.003,
+  silencio ≥0.8s cierra frase, tope 15s; dedupe SHA256 byte-idéntico mic/loop)
 - run.sh → lee plugin_settings.json → env OMNIROUTE_* (key nunca en argv)
 - OverlayDaemon.qml → lanza capture/listen, guarda pluginData
 - OverlayWindow.qml → panel grande con feed (anclas puras, 100% alto)
+- whisper-server: `~/.local/share/whisper-cpp/bin/whisper-server` +
+  `LD_LIBRARY_PATH=~/.local/share/whisper-cpp/lib`; modelo
+  `~/.local/share/voxtype/models/ggml-large-v3-turbo.bin`; puerto 8177
 - Eventos JSONL: enunciado | kb_hit 📚 | ai_answer 💡 | ai_error | info
