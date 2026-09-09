@@ -52,6 +52,30 @@ PluginSettings {
             }, 0, 25000);
     }
 
+    // Opciones para el dropdown del modelo: auto/* primero, luego el resto.
+    readonly property var aiModelOptions: {
+        const opts = [];
+        const autos = root.aiAutoModels;
+        const all = root.aiModels;
+        if (autos.length > 0) {
+            opts.push({ label: "auto/best-chat (recomendado)", value: "auto/best-chat" });
+            for (let i = 0; i < autos.length; i++) {
+                const m = autos[i];
+                if (m !== "auto/best-chat")
+                    opts.push({ label: m, value: m });
+            }
+            if (all.length > autos.length) {
+                opts.push({ label: "─── otros modelos ───", value: "───────" });
+                for (let i = 0; i < all.length; i++) {
+                    const m = all[i];
+                    if (!autos.includes(m))
+                        opts.push({ label: m, value: m });
+                }
+            }
+        }
+        return opts;
+    }
+
     StyledText {
         width: parent.width
         text: "VoxType Recording Overlay"
@@ -301,5 +325,21 @@ PluginSettings {
                  : Theme.surfaceVariantText
             wrapMode: Text.WordWrap
         }
+    }
+
+    // ── Selector de modelo (Fase 2) — aparece tras check exitoso ──────────
+    SelectionSetting {
+        id: aiModelSelector
+        settingKey: "auditorAiModel"
+        label: "Modelo IA para el auditor"
+        description: {
+            if (root.aiTestState === "ok")
+                return root.aiAutoModels.length + " recomendados (" + root.aiModels.length + " totales). Los alias auto/* se adaptan al mejor provider disponible.";
+            if (root.aiTestState === "error")
+                return "Corrige la conexión antes de seleccionar modelo.";
+            return "Primero presiona \"Probar conexión\" para ver los modelos disponibles en tu servicio.";
+        }
+        options: root.aiTestState === "ok" ? root.aiModelOptions : [root.loadValue("auditorAiModel", "auto/best-chat")]
+        defaultValue: "auto/best-chat"
     }
 }
