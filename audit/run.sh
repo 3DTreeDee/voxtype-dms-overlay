@@ -26,8 +26,13 @@ REQ_HASH="$(sha256sum "$REQ" | cut -d' ' -f1)"
 if [[ ! -f "$STAMP" || "$(cat "$STAMP")" != "$REQ_HASH" ]]; then
     log "instalando dependencias (primera vez puede tardar varios minutos)..."
     if command -v uv >/dev/null 2>&1; then
+        # GPU del usuario es AMD (no CUDA): instalar torch desde el índice CPU
+        # evita bajar ~2.5GB de paquetes nvidia-* inútiles. El modelo de
+        # embeddings (384-d) corre de sobra en CPU.
+        VIRTUAL_ENV="$VENV_DIR" uv pip install torch --index-url https://download.pytorch.org/whl/cpu >&2
         VIRTUAL_ENV="$VENV_DIR" uv pip install -r "$REQ" >&2
     else
+        "$VENV_DIR/bin/pip" install torch --index-url https://download.pytorch.org/whl/cpu >&2
         "$VENV_DIR/bin/pip" install -r "$REQ" >&2
     fi
     echo "$REQ_HASH" > "$STAMP"
