@@ -235,6 +235,11 @@ class LiveCapture:
         self._procs: List[asyncio.subprocess.Process] = []
         self._session_wavs: List[Path] = []
         self._seq = 0
+        # Identificador único por instancia: los WAVs de sesión/frase llevan el
+        # PID para que dos auditor.py solapados NUNCA escriban el mismo archivo
+        # (antes: session_00001_*.wav colisionaba → 3 pw-record huérfanos
+        # truncando el mismo WAV → VAD leía audio corrupto, feed remoto perdido).
+        self._run_id = os.getpid()
         # Última frase cerrada por lado (para dedupe byte-idéntico mic/loop)
         self._last_closed: dict = {"tag": None, "digest": None, "at": 0.0}
         # Rediseño 7.9: instante (monotonic) del último audio con VOZ del mic.
@@ -250,6 +255,30 @@ class LiveCapture:
         """Arranca pw-record continuo por lado + lectores de fin-de-frase."""
         if self._running:
             return
+        # Limpiar pw-record huérfanos de corridas anteriores (proceso padre
+        # muerto por SIGKILL sin limpiar hijos). Mata cualquier pw-record que
+        # apunte a NUESTRO tmp_dir, evitando corrupción por escritores múltiples.
+        try:
+            existing = []
+            for p in Path("/proc").glob("[0-9]*/cmdline"):
+                try:
+                    cmd = p.read_bytes().replace(b"\0", b" ").decode("utf-8", "ignore")
+                except Exception:
+                    continue
+                if "pw-record" in cmd and str(self.tmp_dir) in cmd:
+                    pid = int(p.name)
+                    try:
+                        os.kill(pid, 9)
+                        existing.append(pid)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+            if existing:
+                print(__import__("json").dumps({
+                    "type": "info",
+                    "msg": f"muertos {len(existing)} pw-record huérfanos (pid {existing[:5]})",
+                }), flush=True)
+        except Exception as e:
+            logging.getLogger("auditor").warning("limpieza pw-record huérfanos: %s", e)
         self._running = True
         self._rec_task = asyncio.create_task(self._record_loop())
         # info a stdout (JSONL igual que el resto del auditor)
@@ -317,10 +346,10 @@ class LiveCapture:
             return
 
         for tag, src in sides:
-            wav = self.tmp_dir / f"session_{seq:05d}_{tag}.wav"
+            wav = self.tmp_dir / f"session_{self._run_id:06d}_{seq:05d}_{tag}.wav"
             self._session_wavs.append(wav)
             try:
-                proc = await self._pw_record_start(src, wav, sample_rate)
+                proc = await self._pw_record_start(tag, src, wav, sample_rate)
                 if proc:
                     self._procs.append(proc)
             except Exception as e:
@@ -333,7 +362,7 @@ class LiveCapture:
 
         # Un lector por lado; ambos encolan en self._chunks
         for tag, src in sides:
-            wav = self.tmp_dir / f"session_{seq:05d}_{tag}.wav"
+            wav = self.tmp_dir / f"session_{self._run_id:06d}_{seq:05d}_{tag}.wav"
             self._watch_tasks.append(
                 asyncio.create_task(self._watch_side(tag, wav)))
 
@@ -350,15 +379,28 @@ class LiveCapture:
         except asyncio.CancelledError:
             raise
 
-    async def _pw_record_start(self, source: str, out: Path, rate: int
+    async def _pw_record_start(self, tag: str, source: str, out: Path, rate: int
                                ) -> Optional[asyncio.subprocess.Process]:
-        """pw-record CONTINUO (sin --sample-count): graba hasta que lo matemos."""
+        """pw-record CONTINUO (sin --sample-count): graba hasta que lo matemos.
+
+        Si el lado loop apunta a un monitor Bluetooth (bluez_output.*.monitor),
+        PipeWire re-rutea ese monitor al source por defecto (bug conocido).
+        Se usa stream.capture.sink=true para capturar el sink BT directamente
+        y evitar el routing espurio (ver docs/HANDOFF-OPENGODE.md).
+        """
         pw = shutil.which("pw-record")
         if not pw:
             return None
-        cmd = [pw, "--target", source, "--rate", str(rate),
-               "--channels", "1", "--format", "s16",
-               "--latency", "50ms", str(out)]
+        # Opción A: stream.capture.sink=true para BT monitors
+        if tag == "loop" and source.endswith(".monitor") and "bluez_output" in source:
+            sink_name = source[:-8]  # quitar ".monitor"
+            cmd = [pw, "-P", '{ stream.capture.sink=true node.target=%s }' % sink_name,
+                   "--rate", str(rate), "--channels", "1",
+                   "--format", "s16", "--latency", "50ms", str(out)]
+        else:
+            cmd = [pw, "--target", source, "--rate", str(rate),
+                   "--channels", "1", "--format", "s16",
+                   "--latency", "50ms", str(out)]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.DEVNULL,
@@ -493,7 +535,7 @@ class LiveCapture:
 
         self._seq += 1
         ts = int(now * 1000)
-        out = self.tmp_dir / f"phrase_{self._seq:05d}_{ts}_{tag}.wav"
+        out = self.tmp_dir / f"phrase_{self._run_id:06d}_{self._seq:05d}_{ts}_{tag}.wav"
         try:
             _write_phrase_wav(out, frames)
         except Exception:

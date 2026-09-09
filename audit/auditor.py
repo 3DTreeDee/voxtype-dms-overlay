@@ -479,6 +479,29 @@ class MeetingAuditor:
                           vad_threshold=vad_threshold,
                           min_silence_secs=min_silence_secs,
                           max_phrase_secs=max_phrase_secs)
+
+        # ── Crowbar de señales: el daemon mata auditor.py (SIGTERM/SIGINT) al
+        # terminar la reunión. Sin este handler, el proceso muere y los hijos
+        # pw-record QUEDAN HUÉRFANOS escribiendo el mismo WAV de sesión para
+        # siempre (bug: 3 generaciones de pw-record + archivos de 120MB). Con
+        # el handler, cancelamos la tarea principal → el `finally` llama a
+        # cap.stop() → mata los pw-record hijos.
+        import signal
+        loop = asyncio.get_running_loop()
+        main_task = asyncio.current_task()
+
+        def _shutdown_handler():
+            log.info("Señal de cierre recibida — cerrando captura…")
+            main_task.cancel()
+
+        installed = []
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _shutdown_handler)
+                installed.append(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+
         await cap.start()
 
         log.info(f"Capture por frases activo (silencio≥{min_silence_secs}s, "
@@ -528,9 +551,16 @@ class MeetingAuditor:
                         continue
                     out = ask_dir / f"ask_{ts}_{tag}.wav"
                     self._ask_wavs[tag] = out
-                    cmd = [pw, "--target", src, "--rate", str(sr),
-                           "--channels", "1", "--format", "s16",
-                           "--latency", "100ms", str(out)]
+                    # Same fix for BT monitor routing bug (see audio_capture.py)
+                    if tag == "loop" and src.endswith(".monitor") and "bluez_output" in src:
+                        sink_name = src[:-8]
+                        cmd = [pw, "-P", '{ stream.capture.sink=true node.target=%s }' % sink_name,
+                               "--rate", str(sr), "--channels", "1", "--format", "s16",
+                               "--latency", "100ms", str(out)]
+                    else:
+                        cmd = [pw, "--target", src, "--rate", str(sr),
+                               "--channels", "1", "--format", "s16",
+                               "--latency", "100ms", str(out)]
                     try:
                         proc = await asyncio.create_subprocess_exec(
                             *cmd, stdout=asyncio.subprocess.DEVNULL,
@@ -742,6 +772,11 @@ class MeetingAuditor:
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            for sig in installed:
+                try:
+                    loop.remove_signal_handler(sig)
+                except (NotImplementedError, RuntimeError):
+                    pass
             ask_watcher.cancel()
             await cap.stop()
             await whisper.close()
