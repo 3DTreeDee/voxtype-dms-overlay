@@ -265,6 +265,8 @@ PanelWindow {
     // redimensionable (arrastra la esquina ▼), movible (arrastra la cabecera),
     // colapsable a una mini-barra (botón —) y ocultable (botón ✕, reaparece el
     // pill "Auditor" para restaurarlo). Tamaño/posición persisten en pluginData.
+    // La lista del feed está anclada entre la cabecera y el borde inferior del
+    // panel, así que SIEMPRE ocupa el 100% del alto disponible.
     Item {
         id: auditorPanel
         visible: win.auditorMode && !win.auditorHidden
@@ -331,22 +333,31 @@ PanelWindow {
             }
         }
 
-        // Contenido expandido
-        ColumnLayout {
+        // ── Contenido expandido ─────────────────────────────────────────────
+        // Layout por ANCLAS (sin ColumnLayout): cabecera fija arriba; la lista
+        // se ancla entre la cabecera y el borde inferior del panel, así que
+        // ocupa SIEMPRE el 100% del alto disponible, sin importar el tamaño.
+        Item {
             anchors.fill: parent
             anchors.margins: 12
-            spacing: 6
             visible: !win.auditorCollapsed
 
             // ── Cabecera (arrastrable para mover el panel) ──
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 6
+            Item {
+                id: headerRow
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 30
 
+                // Zona de arrastre: ocupa desde la izquierda hasta el ✕.
                 MouseArea {
                     id: headerDrag
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.right: hideBtn.left
+                    anchors.rightMargin: 6
                     cursorShape: Qt.ClosedHandCursor
                     onPressed: {
                         headerDrag.cursorShape = Qt.ClosedHandCursor;
@@ -366,28 +377,29 @@ PanelWindow {
                             d.saveAuditorPanel(auditorPanel.width, auditorPanel.height, auditorPanel.x, auditorPanel.y);
                     }
 
-                    RowLayout {
-                        anchors.fill: parent
+                    Row {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
                         spacing: 8
                         DankIcon {
-                            Layout.preferredWidth: 18
+                            anchors.verticalCenter: parent.verticalCenter
                             name: "groups"
                             size: 18
                             color: Theme.primary
                         }
                         StyledText {
-                            Layout.fillWidth: true
+                            anchors.verticalCenter: parent.verticalCenter
                             text: "Auditor — Reunión en vivo"
                             font.pixelSize: 14
                             font.bold: true
                             color: Theme.surfaceText
-                            elide: Text.ElideRight
                         }
                         // Indicador "en vivo"
                         Rectangle {
-                            Layout.preferredWidth: 8
-                            Layout.preferredHeight: 8
-                            radius: 4
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 9
+                            height: 9
+                            radius: 4.5
                             color: Qt.rgba(0.9, 0.2, 0.2, 0.95)
                             SequentialAnimation on color {
                                 running: win.auditorMode
@@ -399,37 +411,19 @@ PanelWindow {
                     }
                 }
 
-                // Botón colapsar (—)
+                // Botón ocultar (✕) — el más a la derecha
                 Rectangle {
-                    Layout.preferredWidth: 26
-                    Layout.preferredHeight: 26
-                    radius: 6
-                    color: collapseMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : "transparent"
-                    StyledText {
-                        anchors.centerIn: parent
-                        text: "—"
-                        font.pixelSize: 15
-                        color: Theme.surfaceText
-                    }
-                    MouseArea {
-                        id: collapseMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: win.auditorCollapsed = true
-                    }
-                }
-
-                // Botón ocultar (✕)
-                Rectangle {
-                    Layout.preferredWidth: 26
-                    Layout.preferredHeight: 26
-                    radius: 6
+                    id: hideBtn
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 30
+                    height: 30
+                    radius: 7
                     color: hideMouse.containsMouse ? Qt.rgba(0.8, 0.2, 0.2, 0.35) : "transparent"
                     StyledText {
                         anchors.centerIn: parent
                         text: "✕"
-                        font.pixelSize: 13
+                        font.pixelSize: 14
                         color: Theme.errorText
                     }
                     MouseArea {
@@ -440,21 +434,41 @@ PanelWindow {
                         onClicked: win.auditorHidden = true
                     }
                 }
+
+                // Botón colapsar (—) — a la izquierda del ✕
+                Rectangle {
+                    id: collapseBtn
+                    anchors.right: hideBtn.left
+                    anchors.rightMargin: 6
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 30
+                    height: 30
+                    radius: 7
+                    color: collapseMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : "transparent"
+                    StyledText {
+                        anchors.centerIn: parent
+                        text: "—"
+                        font.pixelSize: 17
+                        color: Theme.surfaceText
+                    }
+                    MouseArea {
+                        id: collapseMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: win.auditorCollapsed = true
+                    }
+                }
             }
 
-            StyledText {
-                Layout.fillWidth: true
-                text: "Enunciados de ambos lados · respuestas KB/IA"
-                font.pixelSize: 11
-                color: Theme.surfaceVariantText
-                wrapMode: Text.WordWrap
-            }
-
-            // ── Lista (ocupa TODO el espacio restante) ──
+            // ── Lista del feed: 100% del espacio restante ───────────────────
             Rectangle {
                 id: qlistBox
-                Layout.fillWidth: true
-                Layout.fillHeight: true
+                anchors.top: headerRow.bottom
+                anchors.topMargin: 8
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
                 color: "transparent"
                 clip: true
 
@@ -477,7 +491,7 @@ PanelWindow {
                     delegate: Item {
                         property var e: modelData
                         width: ListView.view.width
-                        height: rowC.implicitHeight + 12
+                        height: Math.max(rowC.implicitHeight + 12, 40)
 
                         Column {
                             id: rowC
@@ -493,17 +507,18 @@ PanelWindow {
                                 spacing: 6
                                 Rectangle {
                                     width: 4
-                                    height: txt.implicitHeight
+                                    height: Math.max(20, contentCol.implicitHeight)
                                     radius: 2
                                     color: (e.speaker === "you") ? Theme.primary : Qt.rgba(0.9, 0.6, 0.2, 0.9)
                                 }
                                 Column {
+                                    id: contentCol
                                     width: parent.width - 10
-                                    spacing: 2
+                                    spacing: 3
                                     StyledText {
                                         width: parent.width
                                         text: (e.type === "kb_hit" || e.type === "ai_answer") ? "Auditor" : (e.speaker === "you") ? "Tú" : "Remoto"
-                                        font.pixelSize: 10
+                                        font.pixelSize: 12
                                         font.bold: true
                                         color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : (e.type === "ai_answer") ? Qt.rgba(0.45, 0.7, 1, 1) : Theme.surfaceVariantText
                                     }
@@ -511,7 +526,7 @@ PanelWindow {
                                         id: txt
                                         width: parent.width
                                         text: e.text || ""
-                                        font.pixelSize: 13
+                                        font.pixelSize: 15
                                         color: Theme.surfaceText
                                         wrapMode: Text.WordWrap
                                     }
@@ -522,7 +537,7 @@ PanelWindow {
                                 width: parent.width
                                 visible: e.type === "kb_hit" || e.type === "ai_answer"
                                 text: (e.type === "kb_hit" ? "📚 " : "💡 ") + (e.answer || "")
-                                font.pixelSize: 12
+                                font.pixelSize: 14
                                 color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : Qt.rgba(0.45, 0.7, 1, 1)
                                 wrapMode: Text.WordWrap
                             }
@@ -530,7 +545,7 @@ PanelWindow {
                                 width: parent.width
                                 visible: e.type === "ai_error"
                                 text: "⚠️ " + (e.error || "")
-                                font.pixelSize: 11
+                                font.pixelSize: 12
                                 color: Theme.errorText
                                 wrapMode: Text.WordWrap
                             }
