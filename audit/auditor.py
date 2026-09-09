@@ -19,7 +19,7 @@ import asyncio
 import logging
 import collections
 from pathlib import Path
-from typing import Dict, List, Optional, Iterator
+from typing import Dict, List, Optional, Iterator, Tuple
 
 from kb_index import KBIndex
 from omniroute_client import OmniRouteClient, OmniRouteConfig, load_config_from_env_or_yaml
@@ -652,6 +652,14 @@ class MeetingAuditor:
         # lo descartamos como eco. La coincidencia es por normalización
         # (lower/acentos/puntuación) para tolerar diferencias menores de ASR.
         _recent: List[Tuple[int, str, str]] = []  # (ts_ms, side, text_norm)
+        # Buffer anti-sidetone (perfil HFP de audífonos BT): el monitor del
+        # sink puede realimentar la voz del usuario (su propio mic vuelve al
+        # sink en llamadas BT) con el MISMO texto que el mic webcam. Retenemos
+        # la frase "remote" 1.2s: si llega el "you" gemelo, gana SIEMPRE "you"
+        # (el mic fijo del widget es la fuente de verdad de lo que dice el
+        # usuario) y el remote se anula sin emitirse.
+        _pending_remote: Dict[str, Tuple[int, str, str]] = {}  # tn → (ts,text,raw)
+        _remote_buf_ms: int = 1200
 
         def _norm(t: str) -> str:
             t = t.lower()
@@ -659,20 +667,13 @@ class MeetingAuditor:
                 t = t.replace(ch, " ")
             return " ".join(t.split())
 
-        def _is_echo(text: str, side: str) -> bool:
-            nonlocal _recent
+        def _has_recent(side: str, tn: str, within_ms: int = 12000) -> bool:
+            """¿Hay una transcripción reciente (ventana 12s) de `side` con el
+            texto normalizado `tn`? (coincidencia por normalización: lower,
+            acentos/puntuación fuera — tolera diferencias menores de ASR)."""
             now = int(time.time() * 1000)
-            # podar fuera de ventana (12s)
-            _recent = [(ts, s, t) for ts, s, t in _recent if now - ts < 12000]
-            tn = _norm(text)
-            if len(tn) < 4:
-                return False
-            for ts, s, t in _recent:
-                if t == tn and s != side:
-                    return True   # mismo texto en el otro lado → eco
-                if t == tn and s == side and now - ts < 3000:
-                    return True   # mismo lado, <3s → artefacto VAD
-            return False
+            return any(now - ts < within_ms and s == side and t == tn
+                       for ts, s, t in _recent)
 
         async def _transcribe(wav: Path, side: str, speaker_raw: str) -> None:
             try:
@@ -689,17 +690,62 @@ class MeetingAuditor:
             text = (text or "").strip()
             if not text or len(text) < 2:
                 return
-            if _is_echo(text, side):
-                log.info(f"[{side}] eco descartado: {text[:80]}")
+            now = int(time.time() * 1000)
+            # podar ventana (12s)
+            _recent[:] = [(ts, s, t) for ts, s, t in _recent if now - ts < 12000]
+            tn = _norm(text)
+            if len(tn) < 4:
+                # sin base para dedupe → emitir directo
+                log.info(f"[{side}] {text[:100]}")
+                await self.process_utterance({
+                    "speaker": side,
+                    "speaker_raw": speaker_raw,
+                    "text": text,
+                    "ts": now,
+                })
                 return
-            _recent.append((int(time.time() * 1000), side, _norm(text)))
-            log.info(f"[{side}] {text[:100]}")
-            await self.process_utterance({
-                "speaker": side,
-                "speaker_raw": speaker_raw,
-                "text": text,
-                "ts": int(time.time() * 1000),
-            })
+            if side == "remote":
+                # 1) el you ya dijo esto (≤12s) → eco directo, descartar ya
+                if _has_recent("you", tn):
+                    log.info(f"[remote] eco descartado (you ya lo dijo): {text[:80]}")
+                    return
+                # 2) buffer anti-sidetone: esperar 1.2s por si el mic (you)
+                #    dice lo mismo (realimentación HFP). Si llega, el you gana
+                #    y este remote se anula; si no, es voz real del interlocutor
+                #    y se emite como Remote.
+                _pending_remote[tn] = (now, text, speaker_raw)
+                await asyncio.sleep(_remote_buf_ms / 1000.0)
+                if _has_recent("you", tn):
+                    log.info(f"[remote] anulado por you (sidetone): {text[:80]}")
+                    return
+                pend = _pending_remote.get(tn)
+                if pend is None or pend[0] != now:
+                    return  # reemplazado/ya emitido por otra vía
+                del _pending_remote[tn]
+                _recent.append((now, "remote", tn))
+                log.info(f"[remote] {text[:100]}")
+                await self.process_utterance({
+                    "speaker": "remote",
+                    "speaker_raw": speaker_raw,
+                    "text": text,
+                    "ts": now,
+                })
+            else:
+                # you: el mic fijo es la fuente de verdad. Si había un remote
+                # pendiente con este texto, se anula (el buffer lo descarta).
+                _pending_remote.pop(tn, None)
+                if _has_recent("remote", tn):
+                    # el remote ya se emitió antes con el mismo texto (eco
+                    # prematuro) — emitimos el you igual: es la corrección.
+                    log.info(f"[you] corrige remote previo: {text[:80]}")
+                _recent.append((now, "you", tn))
+                log.info(f"[you] {text[:100]}")
+                await self.process_utterance({
+                    "speaker": "you",
+                    "speaker_raw": speaker_raw,
+                    "text": text,
+                    "ts": now,
+                })
 
         try:
             while True:

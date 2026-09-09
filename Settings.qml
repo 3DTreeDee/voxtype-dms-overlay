@@ -394,11 +394,18 @@ PluginSettings {
                         const isMon = s.name.endsWith(".monitor");
                         const label = (s.description && s.description !== "") ? s.description : s.name;
                         if (isMon) {
-                            // monitors de sinks virtuales de silencio no sirven
-                            if (s.name.indexOf("auto_null") >= 0 || s.name.indexOf("silence") >= 0)
-                                continue;
+                            // monitor de auto_null/silence no sirve
+                            if (s.name.indexOf("auto_null") >= 0) continue;
                             loops.push({ label: label, value: s.name });
                         } else {
+                            // Mics: EXCLUIR los Bluetooth (bluez_input): usarlos
+                            // cambia el perfil BT a HFP (manos libres), degrada
+                            // el audio y realimenta la voz del usuario al sink →
+                            // captions duplicados/eco. Para reuniones del auditor
+                            // solo mics físicos (webcam/USB).
+                            if (s.name.indexOf("bluez_input") === 0) continue;
+                            if (s.name.indexOf("echo") >= 0 || s.name.indexOf("aec") >= 0) continue;
+                            if (s.name.indexOf("auto_null") >= 0) continue;
                             mics.push({ label: label, value: s.name });
                         }
                     }

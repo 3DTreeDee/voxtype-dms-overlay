@@ -203,6 +203,43 @@ prueba por fase** (regla del usuario, 2026-09-09).
   nombre del subcomando. Al construir comandos en QML, mantener el orden
   `[parser-principal flags] comando [subparser flags]`.
 
+#### Issue 7.5 — La voz del usuario sale como "Remoto" (perfil HFP / sidetone BT)
+- **Síntoma** (prueba 08:55): TODAS las frases del usuario aparecen como
+  "Remoto" y casi nunca como "Tú". Evidencia: los WAVs del lado loop
+  (monitor BT) contienen SU voz ("Eso fue una prueba de pregunta...", "Voy a
+  terminar la reunión").
+- **Causa raíz** (pistas del usuario): en llamadas (Google Meet), los
+  audífonos BT cambian a perfil HFP (manos libres) → el mic BT se activa y el
+  perfil realimenta la propia voz del usuario al sink (sidetone). El monitor
+  BT (lado Remote) capta su voz con ~0 ms de retardo respecto al mic webcam
+  (evidencia: frases loop y mic cerradas al mismo milisegundo). El dedupe
+  anti-eco (7.2) descartaba al que llegaba SEGUNDO → si el loop llegaba 1 ms
+  antes, se descartaba el "you" y se emitía el "remote". Resultado: todo como
+  Remoto.
+- **Fix APLICADO ✅** (commit pendiente):
+  1. **Preferencia "you"**: ante texto idéntico en ambos lados, gana SIEMPRE
+     el mic (you); el remote es el eco descartable (nunca al revés).
+  2. **Buffer anti-sidetone**: la frase "remote" se retiene 1.2 s antes de
+     emitirse; si llega el "you" gemelo en esa ventana, el remote se anula
+     (voz real del interlocutor = texto distinto → se emite normal).
+  3. **Selector de mic sin BT**: Settings.qml excluye `bluez_input*` del
+     dropdown de micrófono (solo mics físicos webcam/USB + System default).
+- **Pendiente de validación**: prueba en vivo del usuario (con y sin llamada).
+
+#### Issues del feed detectados en la prueba 08:55 (pendientes)
+- **7.6 — Texto de la sesión anterior visible al iniciar**: el feed conserva
+  captions viejos al abrir una reunión nueva (el usuario ve "texto anterior"
+  mezclado). Fix propuesto: limpiar el feed al iniciar reunión (daemon).
+- **7.7 — Scroll del feed hacia arriba**: en cada frase nueva el transcript
+  "se sube" (auto-scroll al revés o al inicio); debe auto-scrollear al final
+  para mostrar la frase nueva. Fix propuesto: en OverlayWindow, tras append,
+  posicionar el scroll/ListView al final.
+- **7.8 — Transcripción corrupta al cierre**: la última frase dicha al parar
+  ("Todos mis reproductores estaban pausados") salió con caracteres extraños
+  ("Toðallos mírs reproduktores staðan pausaðus" — patrón islandés ð/í).
+  Hipótesis: frase cortada por el cierre + sin language=es aplicado (¿último
+  request con auto-detect?). Verificar en cierre ordenado.
+
 #### Issue 7.3 — Botón "Preguntar": no se ve la respuesta de la IA
 - **Síntoma** (usuario): presiona preguntar y no aparece respuesta en el feed.
 - **Causa raíz probable**: aún sin diagnosticar. Hipótesis: fallo/timeout del
