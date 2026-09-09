@@ -10,9 +10,12 @@
 - **Fase 3** ✅ Toggle respuestas automáticas / captions-only ✓ (commit `dc0cb03`)
 - **Fase 4** ✅ Push‑to‑ask con botón en panel ✓ (commit `6d5ebc9`)
 - **Fase 5** ✅ Captions rápidos + RAG inteligente ✓ (commit `11d8845`)
-- **Fase 6** 🚧 Motor de transcripción persistente whisper.cpp+Vulkan (reemplaza
+- **Fase 6** ✅ Motor de transcripción persistente whisper.cpp+Vulkan (reemplaza
   `voxtype transcribe`) + captura por fin-de-frase con VAD — arquitectura
-  aprobada por el usuario (2026-09-09)
+  aprobada por el usuario (2026-09-09). Validada end-to-end con voz real
+  (3/3 frases, ~1.3s tras callar) ✓ (commits `f9efc6c`, `31d3e1b`)
+- **Fase 7** 🚧 Correcciones post-prueba real — 3 issues: 7.1 español→inglés
+  repetido, 7.2 duplicado you→remote, 7.3 botón preguntar sin respuesta
 
 ## Visión
 
@@ -139,6 +142,57 @@ transcripción completa.
 - Persistencia del transcript de captions (ya existe naming único por chunk).
 - Ajustes de prompt (idioma, longitud máx, nº de captions de contexto).
 - Documentación en repo + skill voxtype actualizada.
+
+### Fase 7 — Correcciones post-prueba real (reunión 08:12, 1m43s) 🚧
+
+**Contexto**: primera reunión real con Fase 6 tras reiniciar DMS (que tenía el
+código viejo en memoria). El transcript de respaldo (voxtype) capturó bien el
+español; el feed en vivo mostró 3 problemas. Se resuelven **uno a uno con
+prueba por fase** (regla del usuario, 2026-09-09).
+
+#### Issue 7.1 — Español transcrito en inglés y repetido varias veces
+- **Síntoma** (usuario + imagen): la primera frase en español apareció en el
+  feed repetida varias veces, en inglés.
+- **Causa raíz probable**: (a) whisper-server hace auto-detección de idioma
+  por defecto y falla con frases cortas/acento (ya medido: reportó `lang=en`
+  con audio real en español); (b) las "repeticiones" = mismo audio entrando
+  por los DOS lados (ver 7.2) + posibles cortes del VAD por micro-pausas.
+- **Fix propuesto**: pasar `language=es` por defecto al POST /inference
+  (configurable: `AUDITOR_WHISPER_LANG`, vacío = auto). Validar con voz real:
+  5 frases en español → 5 captions correctas sin repetición (tras 7.2).
+
+#### Issue 7.2 — Frase propia duplicada: primero "you", luego "remote"
+- **Síntoma** (usuario): "cuando detectaba algo que yo decía lo señalaba como
+  mío y luego lo repetía con el texto de remoto".
+- **Causa raíz** (código + evidencia): con el sink por defecto SUSPENDED
+  (nada sonando por altavoces — no había remoto), `pw-record --target` del
+  monitor del sink resuelve **silenciosamente al source por defecto = ¡el
+  mic!** → la misma voz se graba por ambos lados; el dedupe por hash
+  byte-idéntico falla porque son dos grabaciones independientes del mismo
+  source (timing/niveles distintos).
+- **Fix propuesto (elegir 1, validar, luego los demás si hiciera falta)**:
+  a) comprobar estado del sink antes de abrir el lado Remote: si está
+  SUSPENDED → no abrir loopback (lado Remote inactivo hasta que suene algo);
+  b) apuntar al monitor por nombre exacto (`<sink>.monitor`) en vez de
+  `--target <default>`; c) dedupe textual: si ambos lados producen el MISMO
+  texto transcrito en ventana ~3s, descartar el 2º (eco).
+
+#### Issue 7.3 — Botón "Preguntar": no se ve la respuesta de la IA
+- **Síntoma** (usuario): presiona preguntar y no aparece respuesta en el feed.
+- **Causa raíz probable**: aún sin diagnosticar. Hipótesis: fallo/timeout del
+  LLM (OmniRoute 20128, modelo auto/best-chat), evento `ai_error` no
+  renderizado, o la respuesta llega pero no se ve (viewport/auto-scroll —
+  patrón conocido del usuario).
+- **Bloqueante de diagnóstico**: el stderr del auditor solo se captura al
+  TERMINAR el proceso (StdioCollector onStreamFinished en AuditorThread.qml)
+  → los logs en vivo de `capture_live` se pierden durante la reunión.
+- **Fix propuesto**: (0) log del capture a archivo
+  (`~/.local/share/voxtype-auditor/live.log`, rotado) para diagnosticar; (1)
+  probar push-to-ask fuera de reunión (misma ruta LLM) y ver si OmniRoute
+  responde; (2) revisar render de `ai_answer`/`ai_error` en OverlayWindow.
+
+**Prueba por fase**: tras cada fix → reunión real corta desde el widget (el
+usuario habla 3 frases en español + 1 push-to-ask) → validar en el feed.
 
 ## Decisiones abiertas (a confirmar con el usuario)
 
