@@ -963,10 +963,11 @@ class WhisperHTTP:
         log.error("whisper-server no respondió a /health a tiempo")
         return False
 
-    async def transcribe(self, wav: Path) -> str:
+    async def transcribe(self, wav) -> str:
         """POST /inference → texto transcrito ('' si falla o no hay voz)."""
         import aiohttp
 
+        wav = Path(wav)
         s = await self._http()
         try:
             form = aiohttp.FormData()
