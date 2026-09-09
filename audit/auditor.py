@@ -448,7 +448,10 @@ class MeetingAuditor:
                            vad_threshold: float = 0.003) -> None:
         """Feed 100% en vivo: captura audio (mic → You, loopback → Remote),
         transcribe cada chunk con `voxtype transcribe` (modelo residente en el
-        daemon de voxtype) y procesa los enunciados con KB/IA."""
+        daemon de voxtype) y procesa los enunciados con KB/IA (según
+        auto_reply). Además, acepta comandos de push-to-ask desde un archivo
+        de señal (Fase 4): ask_start → ask_end → graba audio aparte,
+        transcribe y envía a la IA con contexto de los últimos captions."""
         from audio_capture import LiveCapture, _default_mic_source, _default_loopback_source
 
         voxtype_bin = self._resolve_voxtype()
@@ -467,6 +470,153 @@ class MeetingAuditor:
         log.info(f"Capture en vivo activo (chunk={chunk_secs}s, umbral VAD={vad_threshold})")
         transcribe_tasks: Dict[str, asyncio.Task] = {}
         last_finish: Dict[str, float] = {}   # dedupe: texto repetido en <2 chunks
+
+        # ── Push-to-ask (Fase 4) ────────────────────────────────────────────
+        ask_dir = cap.tmp_dir
+        ask_cmd_file = ask_dir / "ask.cmd"
+        ask_dir.mkdir(parents=True, exist_ok=True)
+        self._ask_buffering = False
+        self._ask_procs: List[asyncio.subprocess.Process] = []   # subprocesses pw-record
+        self._ask_wavs: Dict[str, Path] = {}
+
+        async def _watch_ask_commands():
+            """Vigila ask.cmd cada 200ms para comandos ask_start / ask_end."""
+            while True:
+                try:
+                    if ask_cmd_file.exists():
+                        cmd = ask_cmd_file.read_text("utf-8").strip().lower()
+                        if cmd.startswith("ask_start") and not self._ask_buffering:
+                            await _start_ask_buffer()
+                        elif cmd.startswith("ask_end") and self._ask_buffering:
+                            await _end_ask_buffer()
+                        # Limpiar el archivo tras procesar
+                        if cmd:
+                            ask_cmd_file.write_text("")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+
+        async def _start_ask_buffer():
+            """Inicia grabación raw para push-to-ask (mic + loopback)."""
+            self._ask_buffering = True
+            self._ask_procs = []
+            ts = int(time.time())
+            log.info("🎤 Push-to-ask INICIO")
+            emit({"type": "info", "msg": "🎤 Preguntando… habla ahora"})
+            import shutil
+            pw = shutil.which("pw-record")
+            if pw:
+                sr = 16000
+                for tag, src in [("mic", cap.mic_source),
+                                 ("loop", cap.loop_source)]:
+                    if not src:
+                        continue
+                    out = ask_dir / f"ask_{ts}_{tag}.wav"
+                    self._ask_wavs[tag] = out
+                    cmd = [pw, "--target", src, "--rate", str(sr),
+                           "--channels", "1", "--format", "s16",
+                           "--latency", "100ms", str(out)]
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd, stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL)
+                        self._ask_procs.append(proc)
+                    except Exception as e:
+                        log.warning(f"ask {tag} falló: {e}")
+
+        async def _end_ask_buffer():
+            """Detiene grabación, transcribe y envía a IA."""
+            self._ask_buffering = False
+            log.info("🎤 Push-to-ask FIN — transcribiendo…")
+            emit({"type": "info", "msg": "💭 Pensando…"})
+            # Matar procesos de grabación
+            for p in self._ask_procs:
+                try:
+                    p.terminate()
+                    await asyncio.wait_for(p.wait(), timeout=3)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+            self._ask_procs = []
+            # Esperar pequeños WAVs se terminen de escribir
+            await asyncio.sleep(0.5)
+            # Transcribir cada lado
+            mic_text = ""
+            loop_text = ""
+            for tag, wav in self._ask_wavs.items():
+                if wav and wav.exists() and wav.stat().st_size > 2000:
+                    try:
+                        text = await self._transcribe_wav(voxtype_bin, wav)
+                        if text and text.strip():
+                            if tag == "mic":
+                                mic_text = text.strip()
+                            else:
+                                loop_text = text.strip()
+                    except Exception as e:
+                        log.warning(f"ask transcribe {tag}: {e}")
+                    finally:
+                        # Limpiar WAV temporal
+                        try:
+                            wav.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+            # Construir texto combinado
+            combined = []
+            if mic_text:
+                combined.append(f"Tú: {mic_text}")
+            if loop_text:
+                combined.append(f"Remoto: {loop_text}")
+            ask_text = " | ".join(combined) if combined else ""
+            if not ask_text:
+                log.info("Push-to-ask: silencio o transcripción vacía")
+                emit({"type": "info", "msg": "No se detectó voz durante la pulsación."})
+                return
+            # Contexto de la reunión (últimos captions)
+            convo = self._conversation_block(max_items=10)
+            prompt = (
+                f"Contexto de la reunión (últimos mensajes):\n{convo}\n\n"
+                f"Pregunta capturada:\n{ask_text}\n\n"
+                "Responde la pregunta usando el vault de Obsidian o tu conocimiento."
+            )
+            log.info(f"Push-to-ask: {ask_text[:120]}")
+            # Ejecutar RAG con IA: buscar en KB y responder
+            evt_base = {"speaker": "you", "speaker_raw": "You",
+                        "text": ask_text, "ts": int(time.time() * 1000)}
+            if self._ai_configured():
+                try:
+                    results = self.kb.search(ask_text, top_k=5, min_score=0.20)
+                    answer = await self._ai_answer("you", ask_text, results)
+                    if answer and answer.strip():
+                        if results:
+                            emit({**evt_base, "type": "kb_hit",
+                                  "sources": [{"file_path": r["file_path"],
+                                               "score": round(r["score"], 3)}
+                                              for r in results[:4]],
+                                  "answer": answer.strip()[:900]})
+                        else:
+                            emit({**evt_base, "type": "ai_answer",
+                                  "model": self.ai.config.get_model("kb_fallback").name,
+                                  "answer": answer.strip()[:900]})
+                except Exception as e:
+                    log.warning(f"ask AI error: {e}")
+                    emit({**evt_base, "type": "ai_error", "error": str(e)[:300]})
+            else:
+                # Sin IA: búsqueda KB directa
+                kb_result = self._build_kb_context({"text": ask_text})
+                if kb_result:
+                    emit({**evt_base, "type": "kb_hit",
+                          "sources": kb_result["sources"],
+                          "answer": kb_result["answer"][:600]})
+                else:
+                    emit({**evt_base, "type": "ai_error",
+                          "error": "IA no configurada y KB sin resultados."})
+
+        # Arrancar vigía de comandos push-to-ask en paralelo
+        ask_watcher = asyncio.create_task(_watch_ask_commands())
+
+        self._voxtype_bin = voxtype_bin  # guardar para re-uso en ask
 
         try:
             while True:
@@ -493,6 +643,7 @@ class MeetingAuditor:
                     # limpiar tasks completadas
                     transcribe_tasks = {}
         finally:
+            ask_watcher.cancel()
             await cap.stop()
 
     @staticmethod

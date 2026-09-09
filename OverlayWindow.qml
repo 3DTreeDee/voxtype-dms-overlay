@@ -461,14 +461,15 @@ PanelWindow {
                 }
             }
 
-            // ── Lista del feed: 100% del espacio restante ───────────────────
+            // ── Lista del feed: espacio entre cabecera y botón ────────────────
             Rectangle {
                 id: qlistBox
                 anchors.top: headerRow.bottom
                 anchors.topMargin: 8
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.bottom: parent.bottom
+                anchors.bottom: askBtn.top
+                anchors.bottomMargin: 6
                 color: "transparent"
                 clip: true
 
@@ -561,6 +562,45 @@ PanelWindow {
                     contentItem: Rectangle {
                         radius: 3
                         color: Qt.rgba(1, 1, 1, 0.25)
+                    }
+                }
+            }
+
+            // ── Botón Preguntar (Fase 4 — push-to-ask) ──────────────────────
+            Rectangle {
+                id: askBtn
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 36
+                radius: 8
+                color: askMouse.pressed ? Qt.rgba(0.7, 0.3, 1, 0.5)
+                     : askMouse.containsMouse ? Qt.rgba(0.6, 0.25, 0.9, 0.35)
+                     : Qt.rgba(0.5, 0.2, 0.8, 0.2)
+                border.width: 1
+                border.color: Qt.rgba(0.7, 0.4, 1, 0.4)
+
+                StyledText {
+                    anchors.centerIn: parent
+                    text: askMouse.pressed ? "🎤 Preguntando… suelta para consultar" : "🔍 Preguntar (o ScrollLock)"
+                    font.pixelSize: 13
+                    font.bold: true
+                    color: askMouse.pressed ? Qt.rgba(1, 1, 1, 0.9) : Qt.rgba(0.8, 0.6, 1, 0.9)
+                }
+
+                MouseArea {
+                    id: askMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onPressed: {
+                        const askCmd = "/tmp/voxtype-auditor/ask.cmd";
+                        Proc.runCommand("voxtypeOverlay.askStart", ["mkdir", "-p", "/tmp/voxtype-auditor"], () => {
+                            Proc.runCommand("voxtypeOverlay.askStart2", ["sh", "-c", "echo -n ask_start > " + askCmd], () => {});
+                        });
+                    }
+                    onReleased: {
+                        Proc.runCommand("voxtypeOverlay.askEnd", ["sh", "-c", "echo -n ask_end > /tmp/voxtype-auditor/ask.cmd"], () => {});
                     }
                 }
             }

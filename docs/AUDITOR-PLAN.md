@@ -7,7 +7,7 @@
 
 - **Fase 1** ✅ Botón "Probar conexión" + estado en Settings ✓ (commit `03d0733`)
 - **Fase 2** ✅ Dropdown dinámico de modelos tras check exitoso ✓ (commit `cdbb32b`)
-- **Fase 3** ⬜ Captions en vivo durante la reunión
+- **Fase 3** ✅ Toggle respuestas automáticas / captions-only ✓ (commit `dc0cb03`)
 - **Fase 4** ⬜ Push‑to‑ask con tecla + loopback
 - **Fase 5** ⬜ Pulido y registro
 
