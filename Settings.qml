@@ -370,4 +370,90 @@ PluginSettings {
         options: root.aiTestState === "ok" ? root.aiModelOptions : [root.loadValue("auditorAiModel", "auto/best-chat")]
         defaultValue: "auto/best-chat"
     }
+
+    // ── Dispositivos de audio del auditor (fijos, sin auto-switch) ────────
+    // Requisito del usuario (2026-09-09): el auditor usa EXACTAMENTE estas
+    // fuentes durante la reunión. NO re-resuelve el "default" de PipeWire en
+    // cada arranque — los audífonos Bluetooth cambian el default al
+    // reconectarse y la heurística elegía monitores equivocados (frases
+    // duplicadas you→remote). "System default" = resolución única al arrancar
+    // (comportamiento previo, sin fijar).
+    property var audioMicOptions: []
+    property var audioLoopOptions: []
+
+    function refreshAudioDevices() {
+        Proc.runCommand("voxtypeOverlay.audDevices", ["pactl", "-f", "json", "list", "sources"], (out, exit) => {
+            const mics = [{ label: "System default", value: "" }];
+            const loops = [{ label: "System default", value: "" }];
+            if (exit === 0 && out) {
+                try {
+                    const arr = JSON.parse(out);
+                    for (let i = 0; i < arr.length; i++) {
+                        const s = arr[i];
+                        if (!s || !s.name) continue;
+                        const isMon = s.name.endsWith(".monitor");
+                        const label = (s.description && s.description !== "") ? s.description : s.name;
+                        if (isMon) {
+                            // monitors de sinks virtuales de silencio no sirven
+                            if (s.name.indexOf("auto_null") >= 0 || s.name.indexOf("silence") >= 0)
+                                continue;
+                            loops.push({ label: label, value: s.name });
+                        } else {
+                            mics.push({ label: label, value: s.name });
+                        }
+                    }
+                } catch (e) {
+                    // JSON malformado → solo "System default"
+                }
+            }
+            root.audioMicOptions = mics;
+            root.audioLoopOptions = loops;
+        }, 0);
+    }
+
+    Component.onCompleted: root.refreshAudioDevices()
+
+    Item {
+        width: parent.width
+        height: Math.max(refreshAudioBtn.height, audioDevNote.implicitHeight + Theme.spacingS * 2)
+
+        DankButton {
+            id: refreshAudioBtn
+            anchors.left: parent.left
+            anchors.leftMargin: Theme.spacingM
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Refrescar dispositivos"
+            iconName: "refresh"
+            onClicked: root.refreshAudioDevices()
+        }
+
+        StyledText {
+            id: audioDevNote
+            anchors.left: refreshAudioBtn.right
+            anchors.leftMargin: Theme.spacingM
+            anchors.right: parent.right
+            anchors.rightMargin: Theme.spacingM
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Detecta micrófonos y altavoces de PipeWire. Conecta tus audífonos Bluetooth ANTES de fijar la selección — el auditor no cambiará de dispositivo aunque PipeWire mueva el default."
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
+        }
+    }
+
+    SelectionSetting {
+        settingKey: "auditorMicSource"
+        label: "Micrófono del auditor (lado Tú)"
+        description: "Fuente FIJA para tus captions en reuniones. No cambia aunque PipeWire altere el dispositivo por defecto."
+        options: root.audioMicOptions
+        defaultValue: ""
+    }
+
+    SelectionSetting {
+        settingKey: "auditorLoopSource"
+        label: "Altavoces del auditor (lado Remoto)"
+        description: "Monitor de salida FIJO que captura lo que oyes del interlocutor remoto. Selecciónalo con tus audífonos/altavoces ya conectados."
+        options: root.audioLoopOptions
+        defaultValue: ""
+    }
 }

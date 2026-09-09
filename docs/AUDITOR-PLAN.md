@@ -153,29 +153,40 @@ prueba por fase** (regla del usuario, 2026-09-09).
 #### Issue 7.1 — Español transcrito en inglés y repetido varias veces
 - **Síntoma** (usuario + imagen): la primera frase en español apareció en el
   feed repetida varias veces, en inglés.
-- **Causa raíz probable**: (a) whisper-server hace auto-detección de idioma
-  por defecto y falla con frases cortas/acento (ya medido: reportó `lang=en`
-  con audio real en español); (b) las "repeticiones" = mismo audio entrando
-  por los DOS lados (ver 7.2) + posibles cortes del VAD por micro-pausas.
-- **Fix propuesto**: pasar `language=es` por defecto al POST /inference
-  (configurable: `AUDITOR_WHISPER_LANG`, vacío = auto). Validar con voz real:
-  5 frases en español → 5 captions correctas sin repetición (tras 7.2).
+- **Causa raíz**: (a) whisper-server hace auto-detección de idioma por defecto
+  y falla con frases cortas/acento (ya medido: reportó `lang=en` con audio real
+  en español); (b) las "repeticiones" = mismo audio entrando por los DOS lados
+  (ver 7.2).
+- **Fix APLICADO ✅**: `WhisperHTTP` envía `language=es` por defecto al POST
+  /inference (env `AUDITOR_WHISPER_LANG`; vacío = auto). Validado con voz
+  real: texto español correcto en 0.61s. Pendiente validar en reunión real.
 
 #### Issue 7.2 — Frase propia duplicada: primero "you", luego "remote"
 - **Síntoma** (usuario): "cuando detectaba algo que yo decía lo señalaba como
   mío y luego lo repetía con el texto de remoto".
-- **Causa raíz** (código + evidencia): con el sink por defecto SUSPENDED
-  (nada sonando por altavoces — no había remoto), `pw-record --target` del
-  monitor del sink resuelve **silenciosamente al source por defecto = ¡el
-  mic!** → la misma voz se graba por ambos lados; el dedupe por hash
-  byte-idéntico falla porque son dos grabaciones independientes del mismo
-  source (timing/niveles distintos).
-- **Fix propuesto (elegir 1, validar, luego los demás si hiciera falta)**:
-  a) comprobar estado del sink antes de abrir el lado Remote: si está
-  SUSPENDED → no abrir loopback (lado Remote inactivo hasta que suene algo);
-  b) apuntar al monitor por nombre exacto (`<sink>.monitor`) en vez de
-  `--target <default>`; c) dedupe textual: si ambos lados producen el MISMO
-  texto transcrito en ventana ~3s, descartar el 2º (eco).
+- **Causa raíz**: con el sink por defecto SUSPENDED (nada sonando por
+  altavoces — no había remoto), la heurística de `_default_loopback_source`
+  elegía un monitor que recibía el MISMO mic (monitorización de voxtype o
+  resolución de pw-record al source por defecto) → la misma voz se grababa por
+  ambos lados; el dedupe por hash byte-idéntico no los detecta (dos grabaciones
+  independientes del mismo source, timing/niveles distintos).
+- **Fix APLICADO ✅ (doble, requisito del usuario 2026-09-09 "que respete la
+  opción preconfigurada de altavoces y micrófono por defecto desde el widget,
+  que no vaya haciendo switch" — sus audífonos BT cambian el default)**:
+  1. **Fuentes FIJAS desde GUI**: Settings → VoxType → "Micrófono del auditor
+     (lado Tú)" y "Altavoces del auditor (lado Remoto)" (dropdowns poblados de
+     PipeWire vía pactl + botón Refrescar). OverlayDaemon pasa
+     `--mic-source`/`--loop-source` al capture cuando están definidas → el
+     auditor usa EXACTAMENTE esas fuentes, sin re-resolver el default de
+     PipeWire en cada arranque. Valor vacío = "System default" (resolución
+     única al arrancar, comportamiento previo).
+  2. **Dedupe textual anti-eco** en `capture_live`: ventana de 12s de
+     transcripciones; si el texto normalizado (lower/acentos/puntuación)
+     coincide con uno reciente del OTRO lado → eco descartado (también mismo
+     lado en <3s = artefacto VAD). Validado 4/4 casos de prueba.
+- **Comportamiento con dispositivo fijo no disponible** (p.ej. BT apagado):
+  el lado Remote queda inactivo (pw-record falla solo en ese lado); el lado
+  Tú sigue funcionando. NO switchea a otro dispositivo.
 
 #### Issue 7.3 — Botón "Preguntar": no se ve la respuesta de la IA
 - **Síntoma** (usuario): presiona preguntar y no aparece respuesta en el feed.

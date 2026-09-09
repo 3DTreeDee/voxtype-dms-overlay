@@ -282,6 +282,11 @@ PluginComponent {
         const d = (pluginData && pluginData.auditorScriptDir !== undefined && pluginData.auditorScriptDir !== null) ? pluginData.auditorScriptDir : "";
         return (typeof d === "string") ? d : "";
     }
+    // Fuentes de audio FIJAS del auditor (Settings → VoxType): "" = resolver
+    // el default del sistema UNA vez al arrancar; si vienen definidas se usan
+    // tal cual (--mic-source/--loop-source), SIN re-resolver ni switchear.
+    readonly property string auditorMicSource: (pluginData && pluginData.auditorMicSource !== undefined && pluginData.auditorMicSource !== null) ? pluginData.auditorMicSource : ""
+    readonly property string auditorLoopSource: (pluginData && pluginData.auditorLoopSource !== undefined && pluginData.auditorLoopSource !== null) ? pluginData.auditorLoopSource : ""
 
     // Una sola fuente de verdad: `meetingRunning` lo sincroniza el widget via
     // pluginData.auditorMeetingActive (mismo canal que el resto de config).
@@ -349,6 +354,10 @@ PluginComponent {
                 let args = [root.auditorScript()];
                 if (root.auditorVault !== "")
                     args = args.concat(["--vault", root.auditorVault]);
+                if (root.auditorMicSource !== "")
+                    args = args.concat(["--mic-source", root.auditorMicSource]);
+                if (root.auditorLoopSource !== "")
+                    args = args.concat(["--loop-source", root.auditorLoopSource]);
                 args = args.concat(["capture"]);
                 auditorThread.commandModel = args;
                 auditorThread.start();

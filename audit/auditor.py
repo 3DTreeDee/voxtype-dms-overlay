@@ -483,6 +483,8 @@ class MeetingAuditor:
 
         log.info(f"Capture por frases activo (silencio≥{min_silence_secs}s, "
                  f"tope={max_phrase_secs}s, umbral VAD={vad_threshold})")
+        log.info(f"Fuentes: mic={cap.mic_source!r} loopback={cap.loop_source!r} "
+                 f"(loopback None = lado Remote inactivo, sin sink RUNNING/IDLE)")
 
         # ── Push-to-ask (Fase 4) ────────────────────────────────────────────
         ask_dir = cap.tmp_dir
@@ -639,6 +641,39 @@ class MeetingAuditor:
             return ""
 
         # helper de transcripción compartido por captions y push-to-ask
+        # ── Dedupe anti-eco (Issue 7.2) ─────────────────────────────────────
+        # Si el sink/monitor que captura el lado Remote recibe el MISMO audio
+        # que el mic (monitorización del mic, sink que resuelve al source por
+        # defecto, etc.), la misma frase se transcribe 2 veces (you + remote)
+        # con textos casi idénticos pero WAVs NO byte-idénticos (el dedupe por
+        # hash de audio_capture no los detecta). Mantenemos una ventana de
+        # transcripciones recientes: si el texto normalizado coincide con otro
+        # reciente de DISTINTO lado (o el mismo lado en <3s = artefacto VAD),
+        # lo descartamos como eco. La coincidencia es por normalización
+        # (lower/acentos/puntuación) para tolerar diferencias menores de ASR.
+        _recent: List[Tuple[int, str, str]] = []  # (ts_ms, side, text_norm)
+
+        def _norm(t: str) -> str:
+            t = t.lower()
+            for ch in "áéíóúüñ¿¡.,;:!?()\"'-":
+                t = t.replace(ch, " ")
+            return " ".join(t.split())
+
+        def _is_echo(text: str, side: str) -> bool:
+            nonlocal _recent
+            now = int(time.time() * 1000)
+            # podar fuera de ventana (12s)
+            _recent = [(ts, s, t) for ts, s, t in _recent if now - ts < 12000]
+            tn = _norm(text)
+            if len(tn) < 4:
+                return False
+            for ts, s, t in _recent:
+                if t == tn and s != side:
+                    return True   # mismo texto en el otro lado → eco
+                if t == tn and s == side and now - ts < 3000:
+                    return True   # mismo lado, <3s → artefacto VAD
+            return False
+
         async def _transcribe(wav: Path, side: str, speaker_raw: str) -> None:
             try:
                 if self._transcribe_engine is not None:
@@ -654,6 +689,10 @@ class MeetingAuditor:
             text = (text or "").strip()
             if not text or len(text) < 2:
                 return
+            if _is_echo(text, side):
+                log.info(f"[{side}] eco descartado: {text[:80]}")
+                return
+            _recent.append((int(time.time() * 1000), side, _norm(text)))
             log.info(f"[{side}] {text[:100]}")
             await self.process_utterance({
                 "speaker": side,
@@ -890,13 +929,13 @@ class WhisperHTTP:
       AUDITOR_WHISPER_URL    (default http://127.0.0.1:8177)
       AUDITOR_WHISPER_BIN    (default ~/.local/share/whisper-cpp/bin/whisper-server)
       AUDITOR_WHISPER_MODEL  (default ~/.local/share/voxtype/models/ggml-large-v3-turbo.bin)
-      AUDITOR_WHISPER_LANG   (default '' → auto-detección ES/EN por whisper)
+      AUDITOR_WHISPER_LANG   (default 'es' → español fijo; '' = auto-detección)
     """
 
     def __init__(self, url: Optional[str] = None):
         self.url = (url or os.environ.get("AUDITOR_WHISPER_URL")
                     or "http://127.0.0.1:8177").rstrip("/")
-        self.lang = os.environ.get("AUDITOR_WHISPER_LANG", "").strip()
+        self.lang = os.environ.get("AUDITOR_WHISPER_LANG", "es").strip()
         home = str(Path.home())
         self.bin = (os.environ.get("AUDITOR_WHISPER_BIN")
                     or f"{home}/.local/share/whisper-cpp/bin/whisper-server")
