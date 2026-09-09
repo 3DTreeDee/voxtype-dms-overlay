@@ -108,6 +108,10 @@ class MeetingAuditor:
         self.kb_threshold = float(self.config.get("kb_threshold", 0.70))
         log.info(f"MeetingAuditor.__init__: vault_search={self.vault_search!r} (raw={raw_vs!r}) "
                  f"kb_threshold={self.kb_threshold} auto_reply={self.auto_reply}")
+        # Bitácora de la sesión: se alimenta desde process_utterance y
+        # _end_ask_rag; al terminar capture_live se escribe como archivo JSON
+        # para exportar al vault con timestamps exactos de VAD.
+        self.session_log: List[Dict] = []
         self._last_seen_text: Optional[str] = None  # para dedupe en modo realtime
         # Historial conversacional para el modo RAG con IA: los últimos
         # enunciados (lado + texto) que dan contexto a las referencias
@@ -313,6 +317,13 @@ class MeetingAuditor:
 
         evt_base = {"speaker": side, "speaker_raw": speaker_raw, "text": text, "ts": utterance.get("ts")}
         emit({**evt_base, "type": "enunciado"})
+        self.session_log.append({
+            "ts": utterance.get("ts", int(time.time() * 1000)),
+            "type": "enunciado",
+            "speaker": side,
+            "speaker_raw": speaker_raw,
+            "text": text,
+        })
         self._remember(side, text)
 
         # Fase 3: si auto_reply está OFF, solo emitimos captions (sin IA/KB)
@@ -618,14 +629,30 @@ class MeetingAuditor:
                                                "score": round(r["score"], 3)}
                                               for r in safe_results[:4]],
                                   "answer": answer.strip()[:900]})
+                            self.session_log.append({
+                                "ts": evt_base["ts"], "type": "kb_hit",
+                                "speaker": "you", "text": ask_text,
+                                "answer": answer.strip()[:900],
+                                "sources": [r["file_path"] for r in safe_results[:4]],
+                            })
                         else:
                             log.info(f"_end_ask_rag: EMIT ai_answer, answer=\"{answer[:80]}...\"")
                             emit({**evt_base, "type": "ai_answer",
                                   "model": self.ai.config.get_model("kb_fallback").name,
                                   "answer": answer.strip()[:900]})
+                            self.session_log.append({
+                                "ts": evt_base["ts"], "type": "ai_answer",
+                                "speaker": "you", "text": ask_text,
+                                "answer": answer.strip()[:900],
+                                "model": self.ai.config.get_model("kb_fallback").name,
+                            })
                 except Exception as e:
                     log.warning(f"ask AI error: {e}")
                     emit({**evt_base, "type": "ai_error", "error": str(e)[:300]})
+                    self.session_log.append({
+                        "ts": evt_base["ts"], "type": "ai_error",
+                        "speaker": "you", "text": ask_text, "error": str(e)[:300],
+                    })
             else:
                 log.info(f"_end_ask_rag: IA NO configurada, vault_search={self.vault_search}")
                 if self.vault_search:
@@ -634,6 +661,12 @@ class MeetingAuditor:
                         emit({**evt_base, "type": "kb_hit",
                               "sources": kb_result["sources"],
                               "answer": kb_result["answer"][:600]})
+                        self.session_log.append({
+                            "ts": evt_base["ts"], "type": "kb_hit",
+                            "speaker": "you", "text": ask_text,
+                            "answer": kb_result["answer"][:600],
+                            "sources": [s["file_path"] for s in kb_result["sources"][:4]],
+                        })
                     else:
                         emit({**evt_base, "type": "ai_error",
                               "error": "IA no configurada y KB sin resultados."})
@@ -779,6 +812,15 @@ class MeetingAuditor:
             ask_watcher.cancel()
             await cap.stop()
             await whisper.close()
+            # Escribir bitácora de la sesión como JSON para exportar al vault
+            # con timestamps exactos de VAD (no chunks de 30s).
+            if self.session_log:
+                log_path = cap.tmp_dir / "session_transcript.json"
+                try:
+                    log_path.write_text(json.dumps(self.session_log, indent=2, ensure_ascii=False))
+                    log.info(f"Transcript exacto guardado: {log_path} ({len(self.session_log)} eventos)")
+                except Exception as e:
+                    log.warning(f"No se pudo escribir {log_path}: {e}")
 
     # -- Live meeting: captions rápidos desde transcript.json de voxtype --
     async def live_meeting(self, transcript_path: Optional[Path] = None,
