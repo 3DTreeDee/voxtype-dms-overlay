@@ -75,8 +75,12 @@ class OmniRouteConfig:
         # Fallback al primero disponible
         if self.models:
             return list(self.models.values())[0]
-        # Default hardcoded
-        return ModelConfig(name="gpt-4o-mini", display_name="GPT-4o Mini", tasks=[task])
+        # Sin catálogo (config por env/YAML minimal): usar el nombre del
+        # default_models de la tarea (respeta OMNIROUTE_MODEL_KB, auto/best-chat,
+        # etc.) en vez del "gpt-4o-mini" hardcodeado que rompía el ASK (el router
+        # no tenía credenciales openai).
+        name = self.default_models.get(task, "gpt-4o-mini")
+        return ModelConfig(name=name, display_name=name, tasks=[task])
 
 
 class OmniRouteClient:

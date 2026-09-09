@@ -492,10 +492,31 @@ PanelWindow {
                     delegate: Item {
                         property var e: modelData
                         width: ListView.view.width
-                        height: Math.max(rowC.implicitHeight + 12, 40)
+                        height: e.type === "info"
+                            ? (infoLine.implicitHeight + 8)
+                            : Math.max(rowC.implicitHeight + 12, 40)
+
+                        // Info relevante (estado ask/IA/errores): línea sutil y
+                        // centrada, sin barra de color ni etiqueta de speaker.
+                        StyledText {
+                            id: infoLine
+                            visible: e.type === "info"
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.leftMargin: 6
+                            anchors.right: parent.right
+                            anchors.rightMargin: 6
+                            horizontalAlignment: Text.AlignHCenter
+                            text: e.msg || ""
+                            font.pixelSize: 12
+                            font.italic: true
+                            color: Qt.rgba(1, 1, 1, 0.5)
+                            wrapMode: Text.WordWrap
+                        }
 
                         Column {
                             id: rowC
+                            visible: e.type !== "info"
                             anchors.left: parent.left
                             anchors.leftMargin: 2
                             anchors.right: parent.right
@@ -593,14 +614,20 @@ PanelWindow {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
+                    // Push-to-ask con marcadores SEPARADOS (ask_start / ask_end):
+                    // antes se usaba UN sólo ask.cmd sobreescrito con `echo -n >
+                    // ask.cmd`, y la carrera start/end hacía que el watcher
+                    // perdiera comandos → preguntas sin respuesta. Cada marcador
+                    // es un archivo distinto (touch), sin truncado ni solape.
                     onPressed: {
-                        const askCmd = "/tmp/voxtype-auditor/ask.cmd";
-                        Proc.runCommand("voxtypeOverlay.askStart", ["mkdir", "-p", "/tmp/voxtype-auditor"], () => {
-                            Proc.runCommand("voxtypeOverlay.askStart2", ["sh", "-c", "echo -n ask_start > " + askCmd], () => {});
-                        });
+                        Proc.runCommand("voxtypeOverlay.askStart",
+                            ["sh", "-c", "mkdir -p /tmp/voxtype-auditor && touch /tmp/voxtype-auditor/ask_start"],
+                            () => {});
                     }
                     onReleased: {
-                        Proc.runCommand("voxtypeOverlay.askEnd", ["sh", "-c", "echo -n ask_end > /tmp/voxtype-auditor/ask.cmd"], () => {});
+                        Proc.runCommand("voxtypeOverlay.askEnd",
+                            ["sh", "-c", "touch /tmp/voxtype-auditor/ask_end"],
+                            () => {});
                     }
                 }
             }

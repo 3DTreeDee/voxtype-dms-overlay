@@ -5,40 +5,40 @@ set -euo pipefail
 
 export HF_HUB_OFFLINE=1
 
-# --- Cargar config IA desde plugin_settings.json (GUI) ---
-# Las keys viajan por env (OMNIROUTE_BASE_URL, OMNIROUTE_API_KEY,
-# OMNIROUTE_MODEL_KB) que auditor.py ya reconoce en
-# load_config_from_env_or_yaml().  Así la API key nunca aparece en argv,
-# solo en plugin_settings.json (local) y en la env del proceso hijo.
-python3 -c "
+# Cargar config IA desde plugin_settings.json y exportarla como env vars.
+# El bloque python imprime "export VAR=valor" que bash evalúa ANTES de exec.
+eval "$(python3 -c "
 import json, os
 try:
     d = json.load(open(os.path.expanduser('~/.config/DankMaterialShell/plugin_settings.json')))
-    v = d.get('voxtypeOverlay', {})
-    for k, e in [
-        ('auditorAiBaseUrl', 'OMNIROUTE_BASE_URL'),
-        ('auditorAiApiKey', 'OMNIROUTE_API_KEY'),
-        ('auditorAiModel',  'OMNIROUTE_MODEL_KB'),
-        ('auditorAutoReply', 'AUDITOR_AUTO_REPLY'),
-        ('auditorVaultSearch', 'AUDITOR_VAULT_SEARCH'),
-        ('auditorKbThreshold', 'AUDITOR_KB_THRESHOLD'),
-    ]:
-        val = v.get(k, '')
-        if val:
-            # Convertir threshold de slider (entero 0-100) a float 0.0-1.0
-            if k == 'auditorKbThreshold':
-                try:
-                    pct = int(val)
-                    val = str(max(0, min(100, pct)) / 100.0)
-                except ValueError:
-                    val = '0.70'
-            os.environ[e] = val
 except Exception:
-    pass
-"
+    d = {}
+v = d.get('voxtypeOverlay', {})
+lines = []
+for k, e in [
+    ('auditorAiBaseUrl', 'OMNIROUTE_BASE_URL'),
+    ('auditorAiApiKey', 'OMNIROUTE_API_KEY'),
+    ('auditorAiModel',  'OMNIROUTE_MODEL_KB'),
+    ('auditorAutoReply', 'AUDITOR_AUTO_REPLY'),
+    ('auditorVaultSearch', 'AUDITOR_VAULT_SEARCH'),
+    ('auditorKbThreshold', 'AUDITOR_KB_THRESHOLD'),
+]:
+    val = v.get(k)
+    if val is None or val == '':
+        continue
+    if isinstance(val, bool):
+        val = 'true' if val else 'false'
+    elif k == 'auditorKbThreshold':
+        try:
+            pct = int(val)
+            val = str(max(0, min(100, pct)) / 100.0)
+        except ValueError:
+            val = '0.70'
+    lines.append(f'export {e}={val}')
+print('; '.join(lines), flush=True)
+")"
 
 VENV="${HOME}/.local/share/voxtype-auditor/venv"
 AUDIT_DIR="${HOME}/Proyectos/GitHub/voxtype-dms-overlay/audit"
 
-# Arrancar auditor.py con los args del daemon (--vault, --kb-db, etc.)
 exec "${VENV}/bin/python" "${AUDIT_DIR}/auditor.py" "$@"

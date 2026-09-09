@@ -103,8 +103,11 @@ class MeetingAuditor:
         # Fase 3: toggle respuestas automáticas (default OFF — solo captions)
         self.auto_reply = bool(self.config.get("auto_reply", False))
         # Fase 4/5: toggle vault search y umbral de similitud
-        self.vault_search = bool(self.config.get("vault_search", True))
+        raw_vs = self.config.get("vault_search", True)
+        self.vault_search = bool(raw_vs)
         self.kb_threshold = float(self.config.get("kb_threshold", 0.70))
+        log.info(f"MeetingAuditor.__init__: vault_search={self.vault_search!r} (raw={raw_vs!r}) "
+                 f"kb_threshold={self.kb_threshold} auto_reply={self.auto_reply}")
         self._last_seen_text: Optional[str] = None  # para dedupe en modo realtime
         # Historial conversacional para el modo RAG con IA: los últimos
         # enunciados (lado + texto) que dan contexto a las referencias
@@ -201,6 +204,7 @@ class MeetingAuditor:
     async def _ai_answer(self, side: str, text: str, results: List[Dict]) -> str:
         convo = self._conversation_block(max_items=6)
         who = "Tú" if side == "you" else "Remoto"
+        log.info(f"_ai_answer: results={len(results)} vault_search={self.vault_search} text=\"{text[:50]}\"")
         if results:
             chunks = "\n".join(
                 f"[{r['score']:.2f}] {r['file_path']}: {r['content'][:400]}"
@@ -223,19 +227,36 @@ class MeetingAuditor:
                 "Respuesta (si las notas no sirven, ignóralas):"
             )
         else:
-            system = (
-                "Eres un asistente dentro de una reunión. Te piden información "
-                "que NO está en las notas del vault del usuario. Responde de "
-                "forma breve (máx 90 palabras) y accionable, en el idioma del "
-                "enunciado. Empieza dejando claro que no está en sus notas "
-                "(p.ej. \"No lo tengo en tus notas, pero…\") y luego ayuda con "
-                "tu conocimiento general. No inventes datos de las notas."
-            )
-            user = (
-                f"Contexto de la reunión:\n{convo}\n\n"
-                f"{who}: \"{text}\"\n\n"
-                "(No hay chunks relevantes en el vault.)\n\nRespuesta:"
-            )
+            if not self.vault_search:
+                # Vault OFF: la IA responde SOLO con su conocimiento, sin
+                # referencia a notas del usuario (evita "no lo tengo en tus
+                # notas" que confunde al pedir respuesta de la IA pura).
+                system = (
+                    "Eres un asistente dentro de una reunión. Te piden "
+                    "información. Responde de forma breve (máx 90 palabras) "
+                    "y accionable, en el idioma del enunciado, directamente "
+                    "con tu conocimiento. No menciones notas, documentos ni "
+                    "vaults."
+                )
+                user = (
+                    f"Contexto de la reunión:\n{convo}\n\n"
+                    f"{who}: \"{text}\"\n\n"
+                    "Respuesta:"
+                )
+            else:
+                system = (
+                    "Eres un asistente dentro de una reunión. Te piden información "
+                    "que NO está en las notas del vault del usuario. Responde de "
+                    "forma breve (máx 90 palabras) y accionable, en el idioma del "
+                    "enunciado. Empieza dejando claro que no está en sus notas "
+                    "(p.ej. \"No lo tengo en tus notas, pero…\") y luego ayuda con "
+                    "tu conocimiento general. No inventes datos de las notas."
+                )
+                user = (
+                    f"Contexto de la reunión:\n{convo}\n\n"
+                    f"{who}: \"{text}\"\n\n"
+                    "(No hay chunks relevantes en el vault.)\n\nRespuesta:"
+                )
         return await self.ai.chat_completion(
             [{"role": "system", "content": system},
              {"role": "user", "content": user}],
@@ -250,10 +271,12 @@ class MeetingAuditor:
                 log.info(f"IA: sin respuesta para [{side}] \"{text[:60]}\"")
                 return
             query = decision.get("query") or text
-            # Umbral más laxo que la búsqueda directa: la query ya viene
-            # refinada por la IA, así que incluso un match moderado es útil
-            # como contexto para la respuesta.
-            results = self.kb.search(query, top_k=5, min_score=0.20)
+            results = []
+            if self.vault_search:
+                log.info(f"_process_with_ai: vault_search=True, buscando KB...")
+                results = self.kb.search(query, top_k=5, min_score=0.20)
+            else:
+                log.info(f"_process_with_ai: vault_search=False, saltando KB")
             log.info(f"IA: query=\"{query[:80]}\" → {len(results)} chunk(s) KB")
             answer = await self._ai_answer(side, text, results)
             if not answer or not answer.strip():
@@ -301,9 +324,9 @@ class MeetingAuditor:
             await self._process_with_ai(evt_base, side, text)
             return
 
-        # --- Sin IA: búsqueda KB directa (comportamiento clásico) ---
-        # 1) Buscar en KB
-        kb_context = self._build_kb_context(utterance)
+        # --- Sin IA: búsqueda KB directa (solo si vault_search está ON) ---
+        if self.vault_search:
+            kb_context = self._build_kb_context(utterance)
         if kb_context:
             emit({
                 **evt_base,
@@ -510,137 +533,93 @@ class MeetingAuditor:
                  f"(loopback None = lado Remote inactivo, sin sink RUNNING/IDLE)")
 
         # ── Push-to-ask (Fase 4) ────────────────────────────────────────────
+        # Protocolo con MARCADORES SEPARADOS (ask_start / ask_end): el QML usa
+        # `touch`, por lo que un start no puede ser pisado por un end.
+        #
+        # IMPORTANTE: NO se graba audio aparte con pw-record. Intentar una
+        # segunda captura sobre la misma fuente (el VAD principal ya la tiene)
+        # hace que PipeWire no alimente el WAV del ask → "no se detectó voz"
+        # aunque el usuario esté hablando su pregunta SÍ aparece en el feed
+        # (porque el VAD principal la transcribe). Rediseño: al presionar se
+        # marca el instante y al soltar se recolectan las frases ya transcritas
+        # por el VAD en ese lapso (self._spoken) y se corre el RAG con ellas.
         ask_dir = cap.tmp_dir
-        ask_cmd_file = ask_dir / "ask.cmd"
+        ask_start_file = ask_dir / "ask_start"
+        ask_end_file = ask_dir / "ask_end"
         ask_dir.mkdir(parents=True, exist_ok=True)
+        for stale in (ask_start_file, ask_end_file):
+            try:
+                stale.unlink(missing_ok=True)
+            except Exception:
+                pass
         self._ask_buffering = False
-        self._ask_procs: List[asyncio.subprocess.Process] = []   # subprocesses pw-record
-        self._ask_wavs: Dict[str, Path] = {}
+        self._ask_start_idx = 0
+        # Frases UNICAMENTE transcritas (side, text, ts) para el push-to-ask.
+        # Se alimenta desde _transcribe (abajo) cuando emite un enunciado.
+        self._spoken: List[Tuple[int, str, str]] = []
 
-        async def _watch_ask_commands():
-            """Vigila ask.cmd cada 200ms para comandos ask_start / ask_end."""
-            while True:
-                try:
-                    if ask_cmd_file.exists():
-                        cmd = ask_cmd_file.read_text("utf-8").strip().lower()
-                        if cmd.startswith("ask_start") and not self._ask_buffering:
-                            await _start_ask_buffer()
-                        elif cmd.startswith("ask_end") and self._ask_buffering:
-                            await _end_ask_buffer()
-                        # Limpiar el archivo tras procesar
-                        if cmd:
-                            ask_cmd_file.write_text("")
-                except Exception:
-                    pass
-                await asyncio.sleep(0.2)
+        async def _end_ask_rag(start_idx: int) -> None:
+            """Recolecta las frases del lapso de la pulsación y corre el RAG.
 
-        async def _start_ask_buffer():
-            """Inicia grabación raw para push-to-ask (mic + loopback)."""
-            self._ask_buffering = True
-            self._ask_procs = []
-            ts = int(time.time())
-            log.info("🎤 Push-to-ask INICIO")
-            emit({"type": "info", "msg": "🎤 Preguntando… habla ahora"})
-            import shutil
-            pw = shutil.which("pw-record")
-            if pw:
-                sr = 16000
-                for tag, src in [("mic", cap.mic_source),
-                                 ("loop", cap.loop_source)]:
-                    if not src:
-                        continue
-                    out = ask_dir / f"ask_{ts}_{tag}.wav"
-                    self._ask_wavs[tag] = out
-                    # Same fix for BT monitor routing bug (see audio_capture.py)
-                    if tag == "loop" and src.endswith(".monitor") and "bluez_output" in src:
-                        sink_name = src[:-8]
-                        cmd = [pw, "-P", '{ stream.capture.sink=true node.target=%s }' % sink_name,
-                               "--rate", str(sr), "--channels", "1", "--format", "s16",
-                               "--latency", "100ms", str(out)]
-                    else:
-                        cmd = [pw, "--target", src, "--rate", str(sr),
-                               "--channels", "1", "--format", "s16",
-                               "--latency", "100ms", str(out)]
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            *cmd, stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL)
-                        self._ask_procs.append(proc)
-                    except Exception as e:
-                        log.warning(f"ask {tag} falló: {e}")
-
-        async def _end_ask_buffer():
-            """Detiene grabación, transcribe y envía a IA."""
-            self._ask_buffering = False
-            log.info("🎤 Push-to-ask FIN — transcribiendo…")
+            La frase que el usuario dice MIENTRAS mantiene el botón se cierra
+            (VAD: 0.8s de silencio) y se transcribe (whisper ~0.5s) DESPUÉS de
+            soltar. Por eso esperamos aquí: a que `self._spoken` crezca con
+            frases nuevas (nuevos índices desde `start_idx`) antes de armar la
+            pregunta. Sin esto, el ask se ejecutaba a los 1.5s fijos y la frase
+            todavía estaba en vuelo → "no se detectó voz" aunque el texto
+            aparecía en el feed.
+            """
+            log.info("Push-to-ask FIN — consultando IA…")
             emit({"type": "info", "msg": "💭 Pensando…"})
-            # Matar procesos de grabación
-            for p in self._ask_procs:
-                try:
-                    p.terminate()
-                    await asyncio.wait_for(p.wait(), timeout=3)
-                except Exception:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-            self._ask_procs = []
-            # Esperar pequeños WAVs se terminen de escribir
+            # Esperar a que las frases en vuelo se cierren y transcriban
+            # (hasta ~8s; suelta antes si ya llegó contenido nuevo).
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if len(self._spoken) > start_idx:
+                    break
+                await asyncio.sleep(0.2)
             await asyncio.sleep(0.5)
-            # Transcribir cada lado
-            mic_text = ""
-            loop_text = ""
-            for tag, wav in self._ask_wavs.items():
-                if wav and wav.exists() and wav.stat().st_size > 2000:
-                    try:
-                        text = await self._ask_transcribe(wav)
-                        if text and text.strip():
-                            if tag == "mic":
-                                mic_text = text.strip()
-                            else:
-                                loop_text = text.strip()
-                    except Exception as e:
-                        log.warning(f"ask transcribe {tag}: {e}")
-                    finally:
-                        # Limpiar WAV temporal
-                        try:
-                            wav.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-            # Construir texto combinado
-            combined = []
-            if mic_text:
-                combined.append(f"Tú: {mic_text}")
-            if loop_text:
-                combined.append(f"Remoto: {loop_text}")
-            ask_text = " | ".join(combined) if combined else ""
+            parts = []
+            for ts, side, text in self._spoken[start_idx:]:
+                who = "Tú" if side == "you" else "Remoto"
+                parts.append(f"{who}: {text}")
+            # dedupe conservando orden (una frase puede cerrarse 2 veces? no)
+            seen = set()
+            uniq = []
+            for p in parts:
+                if p not in seen:
+                    seen.add(p)
+                    uniq.append(p)
+            ask_text = " | ".join(uniq) if uniq else ""
             if not ask_text:
-                log.info("Push-to-ask: silencio o transcripción vacía")
+                log.info("Push-to-ask: sin voz en el lapso de pulsación")
                 emit({"type": "info", "msg": "No se detectó voz durante la pulsación."})
                 return
-            # Contexto de la reunión (últimos captions)
-            convo = self._conversation_block(max_items=10)
-            prompt = (
-                f"Contexto de la reunión (últimos mensajes):\n{convo}\n\n"
-                f"Pregunta capturada:\n{ask_text}\n\n"
-                "Responde la pregunta usando el vault de Obsidian o tu conocimiento."
-            )
             log.info(f"Push-to-ask: {ask_text[:120]}")
-            # Ejecutar RAG con IA: buscar en KB y responder
             evt_base = {"speaker": "you", "speaker_raw": "You",
                         "text": ask_text, "ts": int(time.time() * 1000)}
+            log.info(f"_end_ask_rag: start_idx={start_idx} total_spoken={len(self._spoken)} vault_search={self.vault_search} ai_configured={self._ai_configured()}")
             if self._ai_configured():
                 try:
-                    results = self.kb.search(ask_text, top_k=5, min_score=0.20)
+                    results = []
+                    if self.vault_search:
+                        log.info(f"_end_ask_rag: vault_search=True, buscando KB...")
+                        results = self.kb.search(ask_text, top_k=5, min_score=0.20)
+                    else:
+                        log.info(f"_end_ask_rag: vault_search=False, saltando KB")
+                    log.info(f"_end_ask_rag: ask_text=\"{ask_text[:60]}\" → {len(results)} chunks, vault_search={self.vault_search}")
                     answer = await self._ai_answer("you", ask_text, results)
                     if answer and answer.strip():
-                        if results:
+                        safe_results = results if self.vault_search else []
+                        if safe_results:
+                            log.info(f"_end_ask_rag: EMIT kb_hit, results={len(safe_results)} answer=\"{answer[:80]}...\"")
                             emit({**evt_base, "type": "kb_hit",
                                   "sources": [{"file_path": r["file_path"],
                                                "score": round(r["score"], 3)}
-                                              for r in results[:4]],
+                                              for r in safe_results[:4]],
                                   "answer": answer.strip()[:900]})
                         else:
+                            log.info(f"_end_ask_rag: EMIT ai_answer, answer=\"{answer[:80]}...\"")
                             emit({**evt_base, "type": "ai_answer",
                                   "model": self.ai.config.get_model("kb_fallback").name,
                                   "answer": answer.strip()[:900]})
@@ -648,27 +627,44 @@ class MeetingAuditor:
                     log.warning(f"ask AI error: {e}")
                     emit({**evt_base, "type": "ai_error", "error": str(e)[:300]})
             else:
-                # Sin IA: búsqueda KB directa
-                kb_result = self._build_kb_context({"text": ask_text})
-                if kb_result:
-                    emit({**evt_base, "type": "kb_hit",
-                          "sources": kb_result["sources"],
-                          "answer": kb_result["answer"][:600]})
+                log.info(f"_end_ask_rag: IA NO configurada, vault_search={self.vault_search}")
+                if self.vault_search:
+                    kb_result = self._build_kb_context({"text": ask_text})
+                    if kb_result:
+                        emit({**evt_base, "type": "kb_hit",
+                              "sources": kb_result["sources"],
+                              "answer": kb_result["answer"][:600]})
+                    else:
+                        emit({**evt_base, "type": "ai_error",
+                              "error": "IA no configurada y KB sin resultados."})
                 else:
                     emit({**evt_base, "type": "ai_error",
-                          "error": "IA no configurada y KB sin resultados."})
+                          "error": "IA no configurada y búsqueda en vault desactivada."})
+
+        async def _watch_ask_commands():
+            """Vigila ask_start/ask_end cada 200ms (marcadores independientes)."""
+            while True:
+                try:
+                    if ask_start_file.exists() and not self._ask_buffering:
+                        try:
+                            self._ask_buffering = True
+                            self._ask_start_idx = len(self._spoken)
+                            log.info(f"🎤 Push-to-ask INICIO (start_idx={self._ask_start_idx})")
+                            emit({"type": "info", "msg": "🎤 Preguntando… habla ahora"})
+                        finally:
+                            ask_start_file.unlink(missing_ok=True)
+                    if ask_end_file.exists() and self._ask_buffering:
+                        try:
+                            self._ask_buffering = False
+                            await _end_ask_rag(self._ask_start_idx)
+                        finally:
+                            ask_end_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
 
         # Arrancar vigía de comandos push-to-ask en paralelo
         ask_watcher = asyncio.create_task(_watch_ask_commands())
-
-        async def _ask_transcribe(wav: Path) -> str:
-            """Transcribe un WAV con el motor activo (whisper-server o voxtype)."""
-            if self._transcribe_engine is not None:
-                return await self._transcribe_engine.transcribe(wav)
-            vb = self._resolve_voxtype()
-            if vb:
-                return await self._transcribe_wav(vb, wav)
-            return ""
 
         # helper de transcripción compartido por captions y push-to-ask
         # ── Dedupe anti-eco (Issue 7.2) ─────────────────────────────────────
@@ -723,6 +719,7 @@ class MeetingAuditor:
             if len(tn) < 4:
                 # sin base para dedupe → emitir directo
                 log.info(f"[{side}] {text[:100]}")
+                self._spoken.append((now, side, text))
                 await self.process_utterance({
                     "speaker": side,
                     "speaker_raw": speaker_raw,
@@ -739,6 +736,7 @@ class MeetingAuditor:
                     return
                 _recent.append((now, "remote", tn))
                 log.info(f"[remote] {text[:100]}")
+                self._spoken.append((now, side, text))
                 await self.process_utterance({
                     "speaker": "remote",
                     "speaker_raw": speaker_raw,
@@ -749,6 +747,7 @@ class MeetingAuditor:
                 # you: el mic fijo es la fuente de verdad de la voz del usuario.
                 _recent.append((now, "you", tn))
                 log.info(f"[you] {text[:100]}")
+                self._spoken.append((now, side, text))
                 await self.process_utterance({
                     "speaker": "you",
                     "speaker_raw": speaker_raw,
@@ -786,17 +785,27 @@ class MeetingAuditor:
                            poll_interval: float = 0.5) -> None:
         """Modo reunión en vivo: lee el transcript.json que voxtype genera
         en tiempo real (segmentos cada ~2-3s) y los muestra como captions.
-        Push-to-ask: recibe comandos via ask.cmd, recolecta segmentos del
-        lapso de la pulsación (texto ya transcrito, sin grabar audio)."""
+        Push-to-ask: recibe comandos via marcadores ask_start/ask_end,
+        recolecta segmentos del lapso de la pulsación (texto ya transcrito,
+        sin grabar audio)."""
         last_seen_id = -1
         last_path: Optional[Path] = None
         running_meeting = True
         log.info("Modo live: vigilando transcript.json (captions rápidos + push-to-ask)")
 
         # ── Push-to-ask: solo texto, sin pw-record ─────────────────────────
+        # Mismo protocolo de marcadores separados que capture_live (ask_start /
+        # ask_end con touch desde el QML) — un solo ask.cmd perdía comandos por
+        # carrera.
         ask_dir = Path("/tmp/voxtype-auditor")
-        ask_cmd_file = ask_dir / "ask.cmd"
+        ask_start_file = ask_dir / "ask_start"
+        ask_end_file = ask_dir / "ask_end"
         ask_dir.mkdir(parents=True, exist_ok=True)
+        for stale in (ask_start_file, ask_end_file):
+            try:
+                stale.unlink(missing_ok=True)
+            except Exception:
+                pass
         self._ask_buffering = False
         self._ask_start_id = -1   # último segment ID visto al presionar
     
@@ -815,18 +824,20 @@ class MeetingAuditor:
             return " ".join(parts) if parts else ""
 
         async def _watch_ask_commands():
-            """Vigila ask.cmd cada 200ms: ask_start marca tiempo, ask_end
+            """Vigila ask_start/ask_end cada 200ms: start marca tiempo, end
             recolecta segmentos y ejecuta RAG."""
             while running_meeting:
                 try:
-                    if ask_cmd_file.exists():
-                        cmd = ask_cmd_file.read_text("utf-8").strip().lower()
-                        if cmd.startswith("ask_start") and not self._ask_buffering:
+                    if ask_start_file.exists() and not self._ask_buffering:
+                        try:
                             self._ask_buffering = True
                             self._ask_start_id = last_seen_id
                             log.info("🎤 Push-to-ask INICIO")
                             emit({"type": "info", "msg": "🎤 Preguntando… habla ahora"})
-                        elif cmd.startswith("ask_end") and self._ask_buffering:
+                        finally:
+                            ask_start_file.unlink(missing_ok=True)
+                    if ask_end_file.exists() and self._ask_buffering:
+                        try:
                             self._ask_buffering = False
                             log.info("🎤 Push-to-ask FIN — consultando IA…")
                             emit({"type": "info", "msg": "💭 Pensando…"})
@@ -849,8 +860,8 @@ class MeetingAuditor:
                                 evt_base = {"speaker": "you", "speaker_raw": "You",
                                             "text": ask_text, "ts": int(time.time() * 1000)}
                                 await self._execute_ask_rag(evt_base, ask_text)
-                        if cmd:
-                            ask_cmd_file.write_text("")
+                        finally:
+                            ask_end_file.unlink(missing_ok=True)
                 except Exception:
                     pass
                 await asyncio.sleep(0.2)

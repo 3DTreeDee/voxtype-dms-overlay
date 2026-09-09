@@ -138,10 +138,19 @@ Item {
     }
 
     function _enqueue(evt) {
-        if (evt.type === "info") return;   // metadatos no entran a la cola visual
+        // Los "info" del sistema (captura por frase, pw-record terminó, etc.)
+        // ensucian el feed; solo pasan los relevantes al flujo ask/IA/errores.
+        if (evt.type === "info" && !_isRelevantInfo(evt)) return;
         root.events = root.events.concat([evt]);
         if (root.events.length > root.maxEvents)
             root.events = root.events.slice(root.events.length - root.maxEvents);
+    }
+
+    // Info relevantes: estado del push-to-ask y advertencias del motor de
+    // transcripción. Todo lo demás (metadatos de captura) queda fuera del feed.
+    function _isRelevantInfo(evt) {
+        if (!evt || evt.type !== "info" || !evt.msg) return false;
+        return /Preguntando|Pensando|No se detect|whisper-server no disponible|Motor whisper/i.test(String(evt.msg));
     }
 
     function _emitInfo(msg) {
