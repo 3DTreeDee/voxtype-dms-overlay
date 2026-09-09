@@ -188,6 +188,21 @@ prueba por fase** (regla del usuario, 2026-09-09).
   el lado Remote queda inactivo (pw-record falla solo en ese lado); el lado
   Tú sigue funcionando. NO switchea a otro dispositivo.
 
+#### Issue 7.4 — Capture moría al arrancar desde el widget (nada en el feed)
+- **Síntoma** (reuniones 08:32/08:33): el usuario configura las fuentes en
+  Settings, inicia reunión, habla → el feed NO muestra nada (el transcript de
+  respaldo de voxtype sí captura).
+- **Causa raíz**: el daemon construía `run.sh --mic-source X --loop-source Y
+  capture` — pero esos flags pertenecen al SUBPARSER `capture` de argparse →
+  "unrecognized arguments", exit 2, proceso muerto al nacer. `--vault` sí es
+  del parser principal (por eso solo fallaba con fuentes fijas).
+- **Fix APLICADO ✅** (commit `48d934d`): los flags se concatenan SIEMPRE
+  después de `"capture"`. Validado manualmente: el capture con las fuentes del
+  usuario transcribe en vivo (español correcto con language=es).
+- **Lección**: en argparse, los flags de un subparser NO pueden preceder al
+  nombre del subcomando. Al construir comandos en QML, mantener el orden
+  `[parser-principal flags] comando [subparser flags]`.
+
 #### Issue 7.3 — Botón "Preguntar": no se ve la respuesta de la IA
 - **Síntoma** (usuario): presiona preguntar y no aparece respuesta en el feed.
 - **Causa raíz probable**: aún sin diagnosticar. Hipótesis: fallo/timeout del
