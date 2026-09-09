@@ -1,4 +1,6 @@
 import QtQuick
+import QtQuick.Layouts
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Wayland
 import qs.Common
@@ -26,6 +28,32 @@ PanelWindow {
     // reunión en progreso. No requiere daemon.active (que es dictado ptt).
     readonly property bool auditorMode: daemon && daemon.auditorEnabled && daemon.meetingRunning
 
+    // Estado del panel del auditor (colapsado/oculto). No persisten entre
+    // reuniones: cada reunión nueva arranca con el panel expandido.
+    property bool auditorCollapsed: false
+    property bool auditorHidden: false
+
+    // Cada reunión nueva: re-aplicar geometría guardada (el Item solo se crea
+    // una vez al cargar el plugin) y resetear colapso/oculto.
+    onAuditorModeChanged: {
+        if (!auditorMode) return;
+        auditorCollapsed = false;
+        auditorHidden = false;
+        Qt.callLater(() => {
+            const d = win.daemon || {};
+            const defW = Math.max(420, Math.min(win.width * 0.48, 980));
+            const defH = Math.max(360, Math.min(win.height * 0.60, 900));
+            const dw = Math.max(340, Math.min(d.auditorPanelW > 0 ? d.auditorPanelW : defW, win.width - 32));
+            const dh = Math.max(200, Math.min(d.auditorPanelH > 0 ? d.auditorPanelH : defH, win.height - 32));
+            auditorPanel.width = dw;
+            auditorPanel.height = dh;
+            auditorPanel.x = (d.auditorPanelX >= 0) ? Math.min(d.auditorPanelX, win.width - dw - 8)
+                                                    : win.width - dw - 12;
+            auditorPanel.y = (d.auditorPanelY >= 0) ? Math.min(d.auditorPanelY, win.height - 32)
+                                                    : Math.max(12, (win.height - dh) * 0.08);
+        });
+    }
+
     color: "transparent"
     visible: auditorMode || (daemon ? daemon.active : false)
 
@@ -38,7 +66,7 @@ PanelWindow {
     // (para poder hacer scroll del feed); el resto sigue click-through. En
     // dictado, solo el ✕ (cuando está habilitado).
     mask: Region {
-        item: win.auditorMode ? auditorPanel
+        item: win.auditorMode ? (win.auditorHidden ? auditorMini : auditorPanel)
              : (win.daemon && win.daemon.closeButtonEnabled) ? closeBtn : null
     }
 
@@ -232,150 +260,413 @@ PanelWindow {
         }
     }
 
-    // ── Auditor feed panel (esquina superior derecha) ────────────────────────
-    // Se muestra SOLO en modo auditor (reunión activa + auditor on). Sustituye
-    // el dim full-screen: lista los enunciados de ambos lados y las respuestas
-    // del KB/IA del auditor en tiempo real.
+    // ── Auditor feed panel ───────────────────────────────────────────────────
+    // Modo auditor: en lugar del dim full-screen, un panel GRANDE y
+    // redimensionable (arrastra la esquina ▼), movible (arrastra la cabecera),
+    // colapsable a una mini-barra (botón —) y ocultable (botón ✕, reaparece el
+    // pill "Auditor" para restaurarlo). Tamaño/posición persisten en pluginData.
     Item {
         id: auditorPanel
-        visible: win.auditorMode
-        anchors.top: parent.top
-        anchors.right: parent.right
-        anchors.topMargin: 12
-        anchors.rightMargin: 12
-        width: 460
-        height: Math.min(620, Math.max(300, feed.implicitHeight + 24))
+        visible: win.auditorMode && !win.auditorHidden
+        // Sin anchors: posición libre (x/y) para poder moverlo; defaults en
+        // onCompleted según el tamaño de pantalla.
+        property real startX: 0
+        property real startY: 0
 
+        Component.onCompleted: {
+            const d = win.daemon || {};
+            const defW = Math.max(420, Math.min(win.width * 0.48, 980));
+            const defH = Math.max(360, Math.min(win.height * 0.60, 900));
+            const dw = Math.max(340, Math.min(d.auditorPanelW > 0 ? d.auditorPanelW : defW, win.width - 32));
+            const dh = Math.max(200, Math.min(d.auditorPanelH > 0 ? d.auditorPanelH : defH, win.height - 32));
+            width = dw;
+            height = win.auditorCollapsed ? 44 : dh;
+            x = (d.auditorPanelX >= 0) ? Math.min(d.auditorPanelX, win.width - width - 8)
+                                       : win.width - width - 12;
+            y = (d.auditorPanelY >= 0) ? Math.min(d.auditorPanelY, win.height - 32)
+                                       : Math.max(12, (win.height - dh) * 0.08);
+        }
+
+        // Fondo
         Rectangle {
             anchors.fill: parent
-            radius: 14
-            color: Qt.rgba(0.11, 0.11, 0.13, 0.92)
+            radius: 12
+            color: Qt.rgba(0.09, 0.09, 0.12, 0.94)
             border.width: 1
-            border.color: Qt.rgba(1, 1, 1, 0.12)
+            border.color: Qt.rgba(1, 1, 1, 0.14)
+        }
 
-            Column {
-                id: feed
-                anchors.fill: parent
-                anchors.margins: 12
-                spacing: 8
+        // Colapso: solo cabecera visible en una mini-barra; clic re-expande.
+        MouseArea {
+            anchors.fill: parent
+            visible: win.auditorCollapsed
+            cursorShape: Qt.PointingHandCursor
+            onClicked: win.auditorCollapsed = false
+        }
+        Row {
+            anchors.fill: parent
+            anchors.margins: 12
+            visible: win.auditorCollapsed
+            spacing: 8
+            DankIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                name: "groups"
+                size: 16
+                color: Theme.primary
+            }
+            StyledText {
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Auditor — Reunión en vivo"
+                font.pixelSize: 13
+                font.bold: true
+                color: Theme.surfaceText
+                width: parent.width - 70
+                elide: Text.ElideRight
+            }
+            StyledText {
+                anchors.verticalCenter: parent.verticalCenter
+                text: "…"
+                font.pixelSize: 16
+                color: Theme.surfaceVariantText
+            }
+        }
 
-                // Cabecera
-                Row {
-                    width: parent.width
-                    spacing: 8
-                    DankIcon {
-                        anchors.verticalCenter: parent.verticalCenter
-                        name: "groups"
-                        size: 16
-                        color: Theme.primary
+        // Contenido expandido
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 12
+            spacing: 6
+            visible: !win.auditorCollapsed
+
+            // ── Cabecera (arrastrable para mover el panel) ──
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+
+                MouseArea {
+                    id: headerDrag
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    cursorShape: Qt.ClosedHandCursor
+                    onPressed: {
+                        headerDrag.cursorShape = Qt.ClosedHandCursor;
+                        auditorPanel.startX = mouse.x - auditorPanel.x;
+                        auditorPanel.startY = mouse.y - auditorPanel.y;
                     }
-                    StyledText {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "Auditor — Reunión en vivo"
-                        font.pixelSize: 14
-                        font.bold: true
-                        color: Theme.surfaceText
-                        elide: Text.ElideRight
-                        width: parent.width - 30
+                    onPositionChanged: {
+                        if (!pressed) return;
+                        var nx = Math.max(4, Math.min(win.width - auditorPanel.width - 4, mouse.x - auditorPanel.startX + auditorPanel.x));
+                        var ny = Math.max(4, Math.min(win.height - 40, mouse.y - auditorPanel.startY + auditorPanel.y));
+                        auditorPanel.x = nx;
+                        auditorPanel.y = ny;
                     }
-                }
-                StyledText {
-                    text: "Enunciados de ambos lados · respuestas KB/IA"
-                    font.pixelSize: 11
-                    color: Theme.surfaceVariantText
-                    wrapMode: Text.WordWrap
-                    width: parent.width
-                }
+                    onReleased: {
+                        const d = win.daemon;
+                        if (d && d.saveAuditorPanel)
+                            d.saveAuditorPanel(auditorPanel.width, auditorPanel.height, auditorPanel.x, auditorPanel.y);
+                    }
 
-                // Lista de eventos
-                Rectangle {
-                    id: qlistBox
-                    width: parent.width
-                    height: Math.max(80, Math.min(480, qlist.implicitHeight))
-                    color: "transparent"
-                    clip: true
-
-                    ListView {
-                        id: qlist
+                    RowLayout {
                         anchors.fill: parent
-                        model: win.auditor ? win.auditor.events : []
-                        spacing: 10
-                        cacheBuffer: 400
-                        clip: true
-
-                        // Auto-scroll: mantener lo MÁS RECIENTE visible abajo.
-                        // (Sin esto los eventos nuevos quedan fuera de vista y
-                        // parecen "no llegar" — el bug que reportó el usuario.)
-                        onCountChanged: Qt.callLater(() => {
-                            if (qlist.contentHeight > qlist.height)
-                                qlist.positionViewAtEnd();
-                        })
-                        Component.onCompleted: Qt.callLater(() => qlist.positionViewAtEnd())
-
-                        delegate: Item {
-                            property var e: modelData
-                            width: ListView.view.width
-                            height: rowC.implicitHeight + 14
-
-                            Column {
-                                id: rowC
-                                anchors.left: parent.left
-                                anchors.leftMargin: 2
-                                anchors.right: parent.right
-                                anchors.rightMargin: 2
-                                anchors.verticalCenter: parent.verticalCenter
-                                spacing: 6
-
-                                Row {
-                                    width: parent.width
-                                    spacing: 6
-                                    Rectangle {
-                                        width: 6
-                                        height: txt.implicitHeight
-                                        radius: 3
-                                        color: (e.speaker === "you") ? Theme.primary : Qt.rgba(0.9, 0.6, 0.2, 0.9)
-                                    }
-                                    Column {
-                                        width: parent.width - 12
-                                        spacing: 2
-                                        StyledText {
-                                            width: parent.width
-                                            text: (e.type === "kb_hit" || e.type === "ai_answer") ? "Auditor" : (e.speaker === "you") ? "Tú" : "Remoto"
-                                            font.pixelSize: 10
-                                            font.bold: true
-                                            color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : (e.type === "ai_answer") ? Qt.rgba(0.45, 0.7, 1, 1) : Theme.surfaceVariantText
-                                        }
-                                        StyledText {
-                                            id: txt
-                                            width: parent.width
-                                            text: e.text || ""
-                                            font.pixelSize: 13
-                                            color: Theme.surfaceText
-                                            wrapMode: Text.WordWrap
-                                        }
-                                    }
-                                }
-
-                                StyledText {
-                                    width: parent.width
-                                    visible: e.type === "kb_hit" || e.type === "ai_answer"
-                                    text: (e.type === "kb_hit" ? "📚 " : "💡 ") + (e.answer || "")
-                                    font.pixelSize: 12
-                                    color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : Qt.rgba(0.45, 0.7, 1, 1)
-                                    wrapMode: Text.WordWrap
-                                }
-                                StyledText {
-                                    width: parent.width
-                                    visible: e.type === "ai_error"
-                                    text: "⚠️ " + (e.error || "")
-                                    font.pixelSize: 11
-                                    color: Theme.errorText
-                                    wrapMode: Text.WordWrap
-                                }
+                        spacing: 8
+                        DankIcon {
+                            Layout.preferredWidth: 18
+                            name: "groups"
+                            size: 18
+                            color: Theme.primary
+                        }
+                        StyledText {
+                            Layout.fillWidth: true
+                            text: "Auditor — Reunión en vivo"
+                            font.pixelSize: 14
+                            font.bold: true
+                            color: Theme.surfaceText
+                            elide: Text.ElideRight
+                        }
+                        // Indicador "en vivo"
+                        Rectangle {
+                            Layout.preferredWidth: 8
+                            Layout.preferredHeight: 8
+                            radius: 4
+                            color: Qt.rgba(0.9, 0.2, 0.2, 0.95)
+                            SequentialAnimation on color {
+                                running: win.auditorMode
+                                loops: Animation.Infinite
+                                PropertyAnimation { to: Qt.rgba(0.9, 0.4, 0.2, 0.95); duration: 700 }
+                                PropertyAnimation { to: Qt.rgba(0.9, 0.2, 0.2, 0.95); duration: 700 }
                             }
                         }
                     }
                 }
+
+                // Botón colapsar (—)
+                Rectangle {
+                    Layout.preferredWidth: 26
+                    Layout.preferredHeight: 26
+                    radius: 6
+                    color: collapseMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : "transparent"
+                    StyledText {
+                        anchors.centerIn: parent
+                        text: "—"
+                        font.pixelSize: 15
+                        color: Theme.surfaceText
+                    }
+                    MouseArea {
+                        id: collapseMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: win.auditorCollapsed = true
+                    }
+                }
+
+                // Botón ocultar (✕)
+                Rectangle {
+                    Layout.preferredWidth: 26
+                    Layout.preferredHeight: 26
+                    radius: 6
+                    color: hideMouse.containsMouse ? Qt.rgba(0.8, 0.2, 0.2, 0.35) : "transparent"
+                    StyledText {
+                        anchors.centerIn: parent
+                        text: "✕"
+                        font.pixelSize: 13
+                        color: Theme.errorText
+                    }
+                    MouseArea {
+                        id: hideMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: win.auditorHidden = true
+                    }
+                }
+            }
+
+            StyledText {
+                Layout.fillWidth: true
+                text: "Enunciados de ambos lados · respuestas KB/IA"
+                font.pixelSize: 11
+                color: Theme.surfaceVariantText
+                wrapMode: Text.WordWrap
+            }
+
+            // ── Lista (ocupa TODO el espacio restante) ──
+            Rectangle {
+                id: qlistBox
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                color: "transparent"
+                clip: true
+
+                ListView {
+                    id: qlist
+                    anchors.fill: parent
+                    model: win.auditor ? win.auditor.events : []
+                    spacing: 10
+                    cacheBuffer: 600
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+
+                    // Auto-scroll: mantener lo MÁS RECIENTE visible abajo.
+                    onCountChanged: Qt.callLater(() => {
+                        if (qlist.contentHeight > qlist.height)
+                            qlist.positionViewAtEnd();
+                    })
+                    Component.onCompleted: Qt.callLater(() => qlist.positionViewAtEnd())
+
+                    delegate: Item {
+                        property var e: modelData
+                        width: ListView.view.width
+                        height: rowC.implicitHeight + 12
+
+                        Column {
+                            id: rowC
+                            anchors.left: parent.left
+                            anchors.leftMargin: 2
+                            anchors.right: parent.right
+                            anchors.rightMargin: 2
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 5
+
+                            Row {
+                                width: parent.width
+                                spacing: 6
+                                Rectangle {
+                                    width: 4
+                                    height: txt.implicitHeight
+                                    radius: 2
+                                    color: (e.speaker === "you") ? Theme.primary : Qt.rgba(0.9, 0.6, 0.2, 0.9)
+                                }
+                                Column {
+                                    width: parent.width - 10
+                                    spacing: 2
+                                    StyledText {
+                                        width: parent.width
+                                        text: (e.type === "kb_hit" || e.type === "ai_answer") ? "Auditor" : (e.speaker === "you") ? "Tú" : "Remoto"
+                                        font.pixelSize: 10
+                                        font.bold: true
+                                        color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : (e.type === "ai_answer") ? Qt.rgba(0.45, 0.7, 1, 1) : Theme.surfaceVariantText
+                                    }
+                                    StyledText {
+                                        id: txt
+                                        width: parent.width
+                                        text: e.text || ""
+                                        font.pixelSize: 13
+                                        color: Theme.surfaceText
+                                        wrapMode: Text.WordWrap
+                                    }
+                                }
+                            }
+
+                            StyledText {
+                                width: parent.width
+                                visible: e.type === "kb_hit" || e.type === "ai_answer"
+                                text: (e.type === "kb_hit" ? "📚 " : "💡 ") + (e.answer || "")
+                                font.pixelSize: 12
+                                color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : Qt.rgba(0.45, 0.7, 1, 1)
+                                wrapMode: Text.WordWrap
+                            }
+                            StyledText {
+                                width: parent.width
+                                visible: e.type === "ai_error"
+                                text: "⚠️ " + (e.error || "")
+                                font.pixelSize: 11
+                                color: Theme.errorText
+                                wrapMode: Text.WordWrap
+                            }
+                        }
+                    }
+                }
+
+                // Scrollbar sutil (visible cuando hay scroll)
+                ScrollBar.vertical: ScrollBar {
+                    policy: qlist.contentHeight > qlist.height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+                    width: 6
+                    background: Rectangle { color: "transparent" }
+                    contentItem: Rectangle {
+                        radius: 3
+                        color: Qt.rgba(1, 1, 1, 0.25)
+                    }
+                }
+            }
+        }
+
+        // ── Handle de redimensionado (esquina inferior IZQUIERDA) ──
+        // El panel vive pegado al borde derecho de la pantalla: la esquina que
+        // puede tirar hacia afuera es la inferior-izquierda (arrastra hacia la
+        // izquierda para agrandar; el borde derecho queda fijo). Vertical:
+        // arrastra hacia abajo para más alto.
+        Rectangle {
+            id: resizeHandle
+            visible: !win.auditorCollapsed
+            width: 18
+            height: 18
+            anchors.left: parent.left
+            anchors.bottom: parent.bottom
+            anchors.margins: 2
+            color: resizeMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.12) : "transparent"
+            radius: 4
+
+            Canvas {
+                anchors.centerIn: parent
+                width: 8
+                height: 8
+                onPaint: {
+                    const ctx = getContext("2d");
+                    ctx.strokeStyle = "rgba(255,255,255,0.45)";
+                    ctx.lineWidth = 1.4;
+                    for (let i = 0; i < 2; i++) {
+                        ctx.beginPath();
+                        ctx.moveTo(7, 1 + i * 3.2);
+                        ctx.lineTo(1 + i * 3.2, 7);
+                        ctx.stroke();
+                    }
+                }
+            }
+
+            MouseArea {
+                id: resizeMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.SizeBDiagCursor
+
+                property real baseRight: 0   // borde derecho fijo (global)
+                property real baseY: 0
+                property real pressX: 0
+                property real pressY: 0
+
+                onPressed: {
+                    baseRight = auditorPanel.x + auditorPanel.width;
+                    baseY = auditorPanel.y;
+                    pressX = mouse.x;
+                    pressY = mouse.y;
+                }
+                onPositionChanged: {
+                    if (!pressed) return;
+                    const minW = 340, minH = 220;
+                    // Borde izquierdo sigue al cursor; derecho fijo.
+                    let nx = Math.max(8, Math.min(baseRight - minW, auditorPanel.x + (mouse.x - pressX)));
+                    auditorPanel.x = nx;
+                    auditorPanel.width = baseRight - nx;
+                    // Borde superior fijo; inferior sigue al cursor.
+                    auditorPanel.height = Math.max(minH, Math.min(win.height - 24, auditorPanel.height + (mouse.y - pressY)));
+                }
+                onReleased: {
+                    const d = win.daemon;
+                    if (d && d.saveAuditorPanel)
+                        d.saveAuditorPanel(auditorPanel.width, auditorPanel.height, auditorPanel.x, auditorPanel.y);
+                }
+            }
+        }
+    }
+
+    // Pill "Auditor" cuando el panel está oculto (✕) — clic para restaurar.
+    Rectangle {
+        id: auditorMini
+        visible: win.auditorMode && win.auditorHidden
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.topMargin: 12
+        anchors.rightMargin: 12
+        width: miniRow.implicitWidth + 20
+        height: 34
+        radius: 17
+        color: Qt.rgba(0.09, 0.09, 0.12, 0.94)
+        border.width: 1
+        border.color: Qt.rgba(1, 1, 1, 0.14)
+        z: 10
+
+        Row {
+            id: miniRow
+            anchors.centerIn: parent
+            spacing: 6
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 8
+                height: 8
+                radius: 4
+                color: Qt.rgba(0.9, 0.2, 0.2, 0.95)
+                SequentialAnimation on color {
+                    running: true
+                    loops: Animation.Infinite
+                    PropertyAnimation { to: Qt.rgba(0.9, 0.4, 0.2, 0.95); duration: 700 }
+                    PropertyAnimation { to: Qt.rgba(0.9, 0.2, 0.2, 0.95); duration: 700 }
+                }
+            }
+            StyledText {
+                text: "Auditor"
+                font.pixelSize: 12
+                font.bold: true
+                color: Theme.surfaceText
+            }
+        }
+        MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: {
+                win.auditorHidden = false;
+                win.auditorCollapsed = false;
             }
         }
     }

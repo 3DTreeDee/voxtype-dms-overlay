@@ -362,4 +362,20 @@ PluginComponent {
         if (typeof pluginService !== "undefined" && pluginService)
             pluginService.savePluginData(pluginId, "auditorEnabled", v);
     }
+
+    // ── Persistencia del panel del auditor (tamaño/posición) ─────────────────
+    // El usuario redimensiona/mueve el feed; guardamos para la siguiente
+    // reunión. 0/negativo = sin preferencia (defaults por tamaño de pantalla).
+    readonly property int auditorPanelW: (pluginData && pluginData.auditorPanelW !== undefined) ? pluginData.auditorPanelW : 0
+    readonly property int auditorPanelH: (pluginData && pluginData.auditorPanelH !== undefined) ? pluginData.auditorPanelH : 0
+    readonly property int auditorPanelX: (pluginData && pluginData.auditorPanelX !== undefined) ? pluginData.auditorPanelX : -1
+    readonly property int auditorPanelY: (pluginData && pluginData.auditorPanelY !== undefined) ? pluginData.auditorPanelY : -1
+
+    function saveAuditorPanel(w, h, x, y) {
+        if (typeof pluginService === "undefined" || !pluginService) return;
+        pluginService.savePluginData(pluginId, "auditorPanelW", Math.max(0, Math.round(w)));
+        pluginService.savePluginData(pluginId, "auditorPanelH", Math.max(0, Math.round(h)));
+        pluginService.savePluginData(pluginId, "auditorPanelX", Math.max(-1, Math.round(x)));
+        pluginService.savePluginData(pluginId, "auditorPanelY", Math.max(-1, Math.round(y)));
+    }
 }
