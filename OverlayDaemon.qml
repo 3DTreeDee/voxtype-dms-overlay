@@ -292,12 +292,13 @@ PluginComponent {
             root.meetingRunning = pluginData.auditorMeetingActive;
     }
 
-    // Resolver path al script del auditor (el helper Python).
+    // Resolver path al launcher del auditor (run.sh: gestiona venv propio,
+    // portable a cualquier máquina sin depender del venv de Hermes).
     function auditorScript() {
         if (root.auditorScriptDir !== "")
-            return root.auditorScriptDir + "/audit/auditor.py";
+            return root.auditorScriptDir + "/audit/run.sh";
         const home = Quickshell.env("HOME") || "";
-        return home + "/.config/DankMaterialShell/plugins/voxtypeOverlay/audit/auditor.py";
+        return home + "/.config/DankMaterialShell/plugins/voxtypeOverlay/audit/run.sh";
     }
 
     function swapScript() {
@@ -327,14 +328,16 @@ PluginComponent {
         }
 
         // 2) Lanzar el helper en modo `listen` (recibe enunciados por stdin; el
-        //    widget/daemon los inyecta vía feedUtterance). Así no dependemos del
-        //    formato del transcript en disco.
-        auditorThread.stop();
-        let args = [root.auditorScript(), "listen"];
-        if (root.auditorVault !== "")
-            args = args.concat(["--vault", root.auditorVault]);
-        auditorThread.commandModel = args;
-        auditorThread.start();
+                //    widget/daemon los inyecta vía feedUtterance). Así no dependemos del
+                //    formato del transcript en disco.
+                //    (Opciones comunes --vault/--config van ANTES del subcomando en argparse.)
+                auditorThread.stop();
+                let args = [root.auditorScript()];
+                if (root.auditorVault !== "")
+                    args = args.concat(["--vault", root.auditorVault]);
+                args = args.concat(["listen"]);
+                auditorThread.commandModel = args;
+                auditorThread.start();
     }
 
     function stopAuditor() {

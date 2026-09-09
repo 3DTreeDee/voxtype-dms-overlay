@@ -60,6 +60,15 @@ class KBIndex:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(chunk_hash)")
             conn.commit()
 
+    @staticmethod
+    def _normalized(emb):
+        """Normaliza el embedding a norma L2 (compatible con sentence-transformers 5+/6)."""
+        arr = np.asarray(emb, dtype=np.float32)
+        if arr.ndim == 1:
+            n = np.linalg.norm(arr)
+            return arr / n if n > 0 else arr
+        return arr / np.linalg.norm(arr, axis=1, keepdims=True)
+
     def _file_hash(self, path: Path) -> float:
         return path.stat().st_mtime
 
@@ -100,6 +109,13 @@ class KBIndex:
             elif t.is_dir():
                 md_files.extend(t.rglob("*.md"))
 
+        # Excluir carpetas ocultas (.obsidian, .opencode, .trash...) y node_modules
+        def _is_junk(p: Path) -> bool:
+            rel_parts = p.relative_to(self.vault_path).parts
+            return any(part.startswith(".") or part == "node_modules" for part in rel_parts)
+
+        md_files = [f for f in md_files if not _is_junk(f)]
+
         indexed = 0
         for f in md_files:
             try:
@@ -117,7 +133,8 @@ class KBIndex:
                 chunks = self._chunk_text(content)
                 for idx, chunk in enumerate(chunks):
                     chunk_hash = self._content_hash(chunk)
-                    emb = self.model.encode(chunk, normalize_embeddings=True)
+                    emb = self.model.encode(chunk)
+                    emb = self._normalized(emb)
 
                     with sqlite3.connect(self.db_path) as conn:
                         cur = conn.execute(
@@ -151,8 +168,8 @@ class KBIndex:
         Busca semánticamente en el índice.
         Retorna lista de dicts: {file_path, chunk_idx, content, score, file_mtime}
         """
-        q_emb = self.model.encode(query, normalize_embedding=True)
-        q_emb = q_emb.astype(np.float32)
+        q_emb = self.model.encode(query)
+        q_emb = self._normalized(q_emb).astype(np.float32)
 
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
