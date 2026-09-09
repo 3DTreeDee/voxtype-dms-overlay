@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import qs.Common
 import qs.Widgets
 import qs.Modules.Plugins
@@ -9,6 +10,47 @@ import qs.Modules.Plugins
 PluginSettings {
     id: root
     pluginId: "voxtypeOverlay"
+
+    // ── Prueba de conexión IA (Fase 1 plan auditor v2) ─────────────────────
+    // Estado del check: "idle" | "testing" | "ok" | "error"
+    property string aiTestState: "idle"
+    property string aiTestDetail: ""
+    property var aiModels: []      // catálogo completo (para el dropdown Fase 2)
+    property var aiAutoModels: []  // aliases auto/* (recomendados primero)
+
+    // Resuelve el path al helper de check. Prefiere la config del daemon
+    // (auditorScriptDir apunta al fork en dev) y cae al plugin instalado.
+    function aiCheckScriptPath() {
+        const dir = root.loadValue("auditorScriptDir", "");
+        if (dir)
+            return dir + "/audit/check_omniroute.py";
+        const home = Quickshell.env("HOME") || "";
+        return home + "/.config/DankMaterialShell/plugins/voxtypeOverlay/audit/check_omniroute.py";
+    }
+
+    function testAiConnection() {
+        root.aiTestState = "testing";
+        root.aiTestDetail = "";
+        Proc.runCommand("voxtypeOverlay.aiTest", ["python3", root.aiCheckScriptPath()],
+            (stdout, exitCode) => {
+                let parsed = null;
+                try { parsed = JSON.parse(stdout); } catch (e) { /* noop */ }
+                if (exitCode === 0 && parsed && parsed.ok) {
+                    root.aiTestState = "ok";
+                    root.aiTestDetail = "✓ Conectado a " + parsed.base + " — "
+                        + parsed.count + " modelos disponibles, "
+                        + parsed.latency_ms + " ms";
+                    root.aiModels = parsed.models || [];
+                    root.aiAutoModels = parsed.auto || [];
+                } else {
+                    root.aiTestState = "error";
+                    const msg = parsed && parsed.error ? parsed.error : ("exit " + exitCode);
+                    root.aiTestDetail = "✗ " + msg;
+                    root.aiModels = [];
+                    root.aiAutoModels = [];
+                }
+            }, 0, 25000);
+    }
 
     StyledText {
         width: parent.width
@@ -225,5 +267,39 @@ PluginSettings {
         description: "Tu API key de OmniRoute/OpenAI — solo se guarda localmente y nunca aparece en procesos del sistema."
         defaultValue: ""
         placeholder: "sk-..."
+    }
+
+    // ── Probar conexión + estado (Fase 1) ──────────────────────────────────
+    Item {
+        width: parent.width
+        height: Math.max(aiTestButton.height, aiTestStatus.implicitHeight + Theme.spacingS * 2)
+
+        DankButton {
+            id: aiTestButton
+            anchors.left: parent.left
+            anchors.leftMargin: Theme.spacingM
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.aiTestState === "testing" ? "Probando…" : "Probar conexión"
+            iconName: root.aiTestState === "ok" ? "check_circle" : (root.aiTestState === "error" ? "error" : "wifi_tethering")
+            enabled: root.aiTestState !== "testing"
+            onClicked: root.testAiConnection()
+        }
+
+        StyledText {
+            id: aiTestStatus
+            anchors.left: aiTestButton.right
+            anchors.leftMargin: Theme.spacingM
+            anchors.right: parent.right
+            anchors.rightMargin: Theme.spacingM
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.aiTestState === "idle"
+                ? "Verifica que la base URL y la API key funcionan y lista los modelos disponibles."
+                : root.aiTestDetail
+            font.pixelSize: Theme.fontSizeSmall
+            color: root.aiTestState === "ok" ? "#6fce7a"
+                 : root.aiTestState === "error" ? "#ef8f8f"
+                 : Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
+        }
     }
 }
