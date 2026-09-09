@@ -226,6 +226,29 @@ prueba por fase** (regla del usuario, 2026-09-09).
      dropdown de micrófono (solo mics físicos webcam/USB + System default).
 - **Pendiente de validación**: prueba en vivo del usuario (con y sin llamada).
 
+#### Issue 7.9 — REDISEÑO: prioridad temporal del mic (reemplaza el fix de 7.5)
+- **Por qué**: el enfoque de 7.5 (buffer 1.2s + dedupe textual) seguía siendo
+  frágil: depende de que mic y loop segmenten el audio IGUAL (misma frase,
+  mismo texto). La prueba 09:08 lo demostró: el mic produjo UNA frase gigante
+  de 109s (backlog del lector del WAV) mientras el loop cerraba frases cortas
+  → el buffer no emparejó nada → todo salió "Remoto" otra vez.
+- **Causa del fallo de segmentación**: el lector de `_watch_side` leía TODO el
+  backlog de una vez (`f.read(size - read_pos)`): si se atrasaba, un backlog de
+  minutos entraba en UN chunk → frase de 109s y el tope de 15s inútil.
+- **Rediseño aplicado ✅**:
+  1. **Regla temporal en `audio_capture.py`**: el VAD del mic actualiza
+     `_mic_voice_at` (monotonic) con cada ventana de voz. Si el lado loop
+     cierra una frase con el mic hablando hace <2s → se descarta SIN
+     transcribir (sidetone/eco de la voz del usuario — perfil BT HFP).
+     El Remote solo se emite con el mic en silencio ≥2s = voz real del
+     interlocutor. Ya NO depende de que ambos lados segmenten igual.
+  2. **Fix backlog**: lectura limitada a ~0.4s por iteración (`read_pos +=
+     len(chunk)`) → el VAD corta frases razonables aunque el lector se atrase.
+  3. **`auditor.py` simplificado**: sin buffer de 1.2s; red secundaria = si el
+     texto del remote ya lo emitió el you ≤12s, descartar (eco con retardo).
+- **Pendiente de validación**: prueba en vivo (usuario hablando con BT puestos
+  y algo sonando por el sink: su voz debe salir SIEMPRE como "Tú").
+
 #### Issues del feed detectados en la prueba 08:55 (pendientes)
 - **7.6 — Texto de la sesión anterior visible al iniciar**: el feed conserva
   captions viejos al abrir una reunión nueva (el usuario ve "texto anterior"

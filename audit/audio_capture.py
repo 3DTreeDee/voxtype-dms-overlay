@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 import os
 import shutil
@@ -236,6 +237,13 @@ class LiveCapture:
         self._seq = 0
         # Última frase cerrada por lado (para dedupe byte-idéntico mic/loop)
         self._last_closed: dict = {"tag": None, "digest": None, "at": 0.0}
+        # Rediseño 7.9: instante (monotonic) del último audio con VOZ del mic.
+        # Si el loop cierra una frase mientras el mic habló hace <2s, es
+        # sidetone/eco de la voz del usuario (perfil BT HFP / retorno de
+        # llamada) → se descarta SIN transcribir. El lado Remote solo se emite
+        # cuando el mic lleva ≥2s en silencio (voz real del interlocutor).
+        self._mic_voice_at: float = 0.0
+        self._mic_suppress_secs: float = 2.0
 
     # -- API --
     async def start(self) -> None:
@@ -382,11 +390,17 @@ class LiveCapture:
                     continue
                 with open(wav_path, "rb") as f:
                     f.seek(read_pos)
-                    chunk = f.read(size - read_pos)
+                    # Leer como máximo ~0.4s por iteración: si el lector se
+                    # atrasa (backlog de 100s+), el VAD lo procesa en ráfagas
+                    # cortas y el tope max_phrase_secs corta frases razonables.
+                    # Sin el límite, un backlog gigante entra en UN chunk → una
+                    # sola "frase" de minutos (bug visto en phrase_*_mic de 109s).
+                    MAX_READ = int(SAMPLE_RATE * _SAMPWIDTH * 0.4)
+                    chunk = f.read(min(size - read_pos, MAX_READ))
                 # Si pw-record está a mitad de escritura puede sobrar 1 byte impar
                 if len(chunk) % 2:
                     chunk = chunk[:-1]
-                read_pos = size
+                read_pos += len(chunk)
                 if not chunk:
                     await asyncio.sleep(self.poll_secs)
                     continue
@@ -405,6 +419,9 @@ class LiveCapture:
         secs = len(chunk) / (SAMPLE_RATE * _SAMPWIDTH)
         rms = _rms_bytes(chunk)
         if rms > self.vad_threshold:
+            if tag == "mic":
+                # el usuario está hablando (o hay sonido en su mic) AHORA
+                self._mic_voice_at = time.monotonic()
             if not state.in_speech:
                 state.in_speech = True
                 state.silence_secs = 0.0
@@ -450,6 +467,17 @@ class LiveCapture:
             return  # menos de 250ms de voz: no es frase
 
         peak = max((r for r, _ in wins[:end]), default=0.0)
+
+        # Rediseño 7.9 — prioridad temporal del mic: si el mic (fuente
+        # autoritativa de la voz del usuario) tuvo voz hace <2s, lo que cierra
+        # el lado loop es sidetone/eco de ESA voz (perfil BT HFP / retorno de
+        # llamada) → se descarta sin transcribir. El Remote solo se emite con
+        # el mic en silencio ≥2s (voz real del interlocutor).
+        if tag == "loop" and time.monotonic() - self._mic_voice_at < self._mic_suppress_secs:
+            logging.getLogger("auditor").info(
+                "loop suprimido: mic con voz hace <%.1fs (sidetone/eco del usuario)",
+                self._mic_suppress_secs)
+            return
 
         # Dedupe: si el otro lado cerró una frase byte-idéntica hace <1s
         # (sink SUSPENDED → loopback grabó el mic), descartar el duplicado.

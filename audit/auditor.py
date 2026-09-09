@@ -652,14 +652,10 @@ class MeetingAuditor:
         # lo descartamos como eco. La coincidencia es por normalización
         # (lower/acentos/puntuación) para tolerar diferencias menores de ASR.
         _recent: List[Tuple[int, str, str]] = []  # (ts_ms, side, text_norm)
-        # Buffer anti-sidetone (perfil HFP de audífonos BT): el monitor del
-        # sink puede realimentar la voz del usuario (su propio mic vuelve al
-        # sink en llamadas BT) con el MISMO texto que el mic webcam. Retenemos
-        # la frase "remote" 1.2s: si llega el "you" gemelo, gana SIEMPRE "you"
-        # (el mic fijo del widget es la fuente de verdad de lo que dice el
-        # usuario) y el remote se anula sin emitirse.
-        _pending_remote: Dict[str, Tuple[int, str, str]] = {}  # tn → (ts,text,raw)
-        _remote_buf_ms: int = 1200
+        # Red secundaria del rediseño 7.9: el filtro PRINCIPAL del sidetone
+        # (mic hablando → loop suprimido) ocurre en audio_capture. Aquí solo
+        # descartamos un "remote" cuyo texto ya emitió el mic ≤12s (eco con
+        # retardo, p.ej. retorno de la llamada que llega tarde).
 
         def _norm(t: str) -> str:
             t = t.lower()
@@ -705,23 +701,12 @@ class MeetingAuditor:
                 })
                 return
             if side == "remote":
-                # 1) el you ya dijo esto (≤12s) → eco directo, descartar ya
+                # Red secundaria: si el you ya emitió este texto ≤12s (eco con
+                # retardo que llega después del filtro temporal del mic),
+                # descartar. El filtro PRINCIPAL está en audio_capture.
                 if _has_recent("you", tn):
                     log.info(f"[remote] eco descartado (you ya lo dijo): {text[:80]}")
                     return
-                # 2) buffer anti-sidetone: esperar 1.2s por si el mic (you)
-                #    dice lo mismo (realimentación HFP). Si llega, el you gana
-                #    y este remote se anula; si no, es voz real del interlocutor
-                #    y se emite como Remote.
-                _pending_remote[tn] = (now, text, speaker_raw)
-                await asyncio.sleep(_remote_buf_ms / 1000.0)
-                if _has_recent("you", tn):
-                    log.info(f"[remote] anulado por you (sidetone): {text[:80]}")
-                    return
-                pend = _pending_remote.get(tn)
-                if pend is None or pend[0] != now:
-                    return  # reemplazado/ya emitido por otra vía
-                del _pending_remote[tn]
                 _recent.append((now, "remote", tn))
                 log.info(f"[remote] {text[:100]}")
                 await self.process_utterance({
@@ -731,13 +716,7 @@ class MeetingAuditor:
                     "ts": now,
                 })
             else:
-                # you: el mic fijo es la fuente de verdad. Si había un remote
-                # pendiente con este texto, se anula (el buffer lo descarta).
-                _pending_remote.pop(tn, None)
-                if _has_recent("remote", tn):
-                    # el remote ya se emitió antes con el mismo texto (eco
-                    # prematuro) — emitimos el you igual: es la corrección.
-                    log.info(f"[you] corrige remote previo: {text[:80]}")
+                # you: el mic fijo es la fuente de verdad de la voz del usuario.
                 _recent.append((now, "you", tn))
                 log.info(f"[you] {text[:100]}")
                 await self.process_utterance({
