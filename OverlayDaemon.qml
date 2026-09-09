@@ -354,11 +354,14 @@ PluginComponent {
                 let args = [root.auditorScript()];
                 if (root.auditorVault !== "")
                     args = args.concat(["--vault", root.auditorVault]);
+                // OJO: --mic-source/--loop-source pertenecen al SUBPARSER
+                // `capture` (argparse) → SIEMPRE después de "capture"; antes
+                // provoca "unrecognized arguments" y el proceso muere (exit 2).
+                args = args.concat(["capture"]);
                 if (root.auditorMicSource !== "")
                     args = args.concat(["--mic-source", root.auditorMicSource]);
                 if (root.auditorLoopSource !== "")
                     args = args.concat(["--loop-source", root.auditorLoopSource]);
-                args = args.concat(["capture"]);
                 auditorThread.commandModel = args;
                 auditorThread.start();
             });
