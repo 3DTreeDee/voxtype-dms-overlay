@@ -272,8 +272,16 @@ PluginComponent {
     readonly property bool auditorSwapModel: (pluginData && pluginData.auditorSwapModel !== undefined) ? pluginData.auditorSwapModel : true
     readonly property string auditorModelMeeting: (pluginData && pluginData.auditorModelMeeting !== undefined && pluginData.auditorModelMeeting !== "") ? pluginData.auditorModelMeeting : "large-v3-turbo"
     readonly property string auditorModelDictado: (pluginData && pluginData.auditorModelDictado !== undefined && pluginData.auditorModelDictado !== "") ? pluginData.auditorModelDictado : "small"
-    readonly property string auditorVault: (pluginData && pluginData.auditorVault !== undefined && pluginData.auditorVault !== "") ? pluginData.auditorVault : ""
-    readonly property string auditorScriptDir: (pluginData && pluginData.auditorScriptDir !== undefined && pluginData.auditorScriptDir !== "") ? pluginData.auditorScriptDir : ""
+    // auditorVault: null/undefined/"" en pluginData → "" (default del helper:
+    // ~/Documentos/vault). NUNCA pasar null al comando (rompe la KB).
+    readonly property string auditorVault: {
+        const v = (pluginData && pluginData.auditorVault !== undefined && pluginData.auditorVault !== null) ? pluginData.auditorVault : "";
+        return (typeof v === "string") ? v : "";
+    }
+    readonly property string auditorScriptDir: {
+        const d = (pluginData && pluginData.auditorScriptDir !== undefined && pluginData.auditorScriptDir !== null) ? pluginData.auditorScriptDir : "";
+        return (typeof d === "string") ? d : "";
+    }
 
     // Una sola fuente de verdad: `meetingRunning` lo sincroniza el widget via
     // pluginData.auditorMeetingActive (mismo canal que el resto de config).

@@ -432,6 +432,10 @@ async def main():
         sys.exit(1)
 
     # Init dependencias
+    vault_path = Path(args.vault).expanduser()
+    if args.vault in (None, "", "null", "None") or not vault_path.is_dir():
+        log.error(f"Vault inválido: {args.vault!r} — usando default {Path.home() / 'Documentos/vault'}")
+        args.vault = str(Path.home() / "Documentos/vault")
     kb = KBIndex(args.vault, args.kb_db)
     # Indexar si no existe (primera vez)
     if not Path(kb.db_path).exists():
