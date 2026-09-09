@@ -17,6 +17,7 @@ import time
 import argparse
 import asyncio
 import logging
+import collections
 from pathlib import Path
 from typing import Dict, List, Optional, Iterator
 
@@ -100,6 +101,42 @@ class MeetingAuditor:
         self.kb_top_k = self.config.get("kb_top_k", 3)
         self.max_len = self.config.get("max_utterance_len", 400)
         self._last_seen_text: Optional[str] = None  # para dedupe en modo realtime
+        # Historial conversacional para el modo RAG con IA: los últimos
+        # enunciados (lado + texto) que dan contexto a las referencias
+        # (eso, cómo se conecta, el último proyecto...) al refinar la
+        # búsqueda y al redactar la respuesta.
+        self._conversation = collections.deque(maxlen=12)
+
+    # -- ¿IA configurada? (modo RAG vs. embeddings puros) --
+    def _ai_configured(self) -> bool:
+        return bool(self.ai) and bool(self.ai.config) and bool(self.ai.config.api_key)
+
+    def _remember(self, side: str, text: str) -> None:
+        self._conversation.append({"side": side, "text": text[:200]})
+
+    def _conversation_block(self, max_items: int = 8) -> str:
+        """Formatea el historial reciente como 'Tú: …' / 'Remoto: …'."""
+        lines = []
+        for item in list(self._conversation)[-max_items:]:
+            who = "Tú" if item["side"] == "you" else "Remoto"
+            lines.append(f"{who}: {item['text']}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_json_answer(raw: str) -> Optional[Dict]:
+        """Extrae el primer objeto JSON de la respuesta del modelo (tolera
+        texto alrededor y fences ```json)."""
+        import re
+        if not raw:
+            return None
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
 
     # -- texto plano, sin speakers (para búsqueda KB) --
     def _build_kb_context(self, utterance: Dict) -> Optional[Dict]:
@@ -118,29 +155,124 @@ class MeetingAuditor:
             "answer": answer,
         }
 
-    def _build_messages_for_ai(self, utterance: Dict, kb_context: Optional[Dict] = None) -> List[Dict]:
-        """Construye system+user para la tarea IA de fallback."""
-        side_label = "el usuario (You)" if utterance.get("side") == "you" else "la otra persona (Remote)"
-        text = utterance.get("text", "")
+    # -- Modo RAG con IA -------------------------------------------------------
+    # Pipeline por enunciado:
+    #   1) `_ai_decide_query`: la IA ve el contexto conversacional + el
+    #      enunciado, decide si amerita respuesta y genera una query de
+    #      búsqueda LIMPIA (resuelve referencias) → JSON {"answer": bool,
+    #      "query": str}.
+    #   2) búsqueda KB con esa query (umbral más laxo que el directo).
+    #   3) `_ai_answer`: la IA redacta respuesta breve citando los archivos
+    #      del vault (kb_hit 📚) o, si no hay nada relevante, responde con su
+    #      propio conocimiento avisando que no está en las notas (ai_answer 💡).
+    async def _ai_decide_query(self, side: str, text: str) -> Dict:
+        convo = self._conversation_block(max_items=8)
         system = (
-            "Eres un asistente de apoyo en una reunión técnica. Recibes un enunciado "
-            "y debes responder de forma breve y útil: aclarar, sugerir, corregir o dar "
-            "información relevante. Responde en español salvo que el tema sea ingés.Conserva tecnicismos."
+            "Eres el analizador de un asistente de reunión. Recibes el contexto "
+            "de una conversación y el enunciado MÁS RECIENTE. Decide si ese "
+            "enunciado es una pregunta o un pedido de información que merece "
+            "consultar la base de conocimiento del usuario. "
+            "Responde ÚNICAMENTE con JSON: {\"answer\": true|false, \"query\": \"...\"} "
+            "- answer=false para saludos, muletillas, afirmaciones sin pedir info. "
+            "- query: frase corta (5-15 palabras) que capture QUÉ se pregunta, "
+            "resolviendo referencias del contexto (p.ej. \"eso\", \"el proyecto\", "
+            "\"cómo se conecta\") en términos concretos. Si answer=false, query=\"\"."
         )
-        user = f"Enunciado de {side_label}: \"{text}\""
-        if kb_context:
-            user += (
-                "\n\nContexto relevante de la base de conocimiento (puedes citarlo):\n"
-                + "\n".join(f"- {s['file_path']}: {s['answer'][:300]}" for s in [kb_context])
+        user = (
+            f"Contexto de la reunión:\n{convo}\n\n"
+            f"Enunciado más reciente ({'Tú' if side == 'you' else 'Remoto'}): "
+            f"\"{text}\"\n\nJSON:"
+        )
+        raw = await self.ai.chat_completion(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            task="kb_fallback", temperature=0.0, max_tokens=160)
+        data = self._parse_json_answer(raw) or {}
+        return {
+            "answer": bool(data.get("answer", True)),
+            "query": (data.get("query") or "").strip()[:200],
+        }
+
+    async def _ai_answer(self, side: str, text: str, results: List[Dict]) -> str:
+        convo = self._conversation_block(max_items=6)
+        who = "Tú" if side == "you" else "Remoto"
+        if results:
+            chunks = "\n".join(
+                f"[{r['score']:.2f}] {r['file_path']}: {r['content'][:400]}"
+                for r in results[:4])
+            system = (
+                "Eres un asistente dentro de una reunión. El usuario te pide "
+                "información y tienes notas de su vault de Obsidian. Responde de "
+                "forma breve (máx 90 palabras) y accionable, en el idioma del "
+                "enunciado. Usa SOLO la información de las notas; si no responde "
+                "la pregunta, dilo y no inventes. Cita los archivos relevantes "
+                "al final como: Fuentes: nombre1.md, nombre2.md (solo nombres)."
             )
-        user += "\n\nDa una respuesta breve (máx 100 palabras) y accionable."
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+            user = (
+                f"Contexto de la reunión:\n{convo}\n\n"
+                f"{who}: \"{text}\"\n\n"
+                f"Notas relevantes del vault:\n{chunks}\n\nRespuesta:"
+            )
+        else:
+            system = (
+                "Eres un asistente dentro de una reunión. Te piden información "
+                "que NO está en las notas del vault del usuario. Responde de "
+                "forma breve (máx 90 palabras) y accionable, en el idioma del "
+                "enunciado. Empieza dejando claro que no está en sus notas "
+                "(p.ej. \"No lo tengo en tus notas, pero…\") y luego ayuda con "
+                "tu conocimiento general. No inventes datos de las notas."
+            )
+            user = (
+                f"Contexto de la reunión:\n{convo}\n\n"
+                f"{who}: \"{text}\"\n\n"
+                "(No hay chunks relevantes en el vault.)\n\nRespuesta:"
+            )
+        return await self.ai.chat_completion(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}],
+            task="kb_fallback", temperature=0.2, max_tokens=500)
+
+    async def _process_with_ai(self, evt_base: Dict, side: str, text: str) -> None:
+        """Pipeline RAG: IA decide/refina → KB → IA redacta citando (o responde
+        con conocimiento propio si el vault no tiene nada)."""
+        try:
+            decision = await self._ai_decide_query(side, text)
+            if not decision.get("answer", True):
+                log.info(f"IA: sin respuesta para [{side}] \"{text[:60]}\"")
+                return
+            query = decision.get("query") or text
+            # Umbral más laxo que la búsqueda directa: la query ya viene
+            # refinada por la IA, así que incluso un match moderado es útil
+            # como contexto para la respuesta.
+            results = self.kb.search(query, top_k=5, min_score=0.20)
+            log.info(f"IA: query=\"{query[:80]}\" → {len(results)} chunk(s) KB")
+            answer = await self._ai_answer(side, text, results)
+            if not answer or not answer.strip():
+                log.warning("IA devolvió respuesta vacía")
+                return
+            if results:
+                emit({
+                    **evt_base,
+                    "type": "kb_hit",
+                    "sources": [{"file_path": r["file_path"], "score": round(r["score"], 3)}
+                                for r in results[:4]],
+                    "answer": answer.strip()[:900],
+                })
+            else:
+                emit({
+                    **evt_base,
+                    "type": "ai_answer",
+                    "model": self.ai.config.get_model("kb_fallback").name,
+                    "answer": answer.strip()[:900],
+                })
+        except Exception as e:
+            log.warning(f"IA RAG error: {e}")
+            emit({**evt_base, "type": "ai_error", "error": str(e)[:300]})
 
     async def process_utterance(self, utterance: Dict) -> None:
-        """Procesa UN enunciado: KB -> si falla -> IA."""
+        """Procesa UN enunciado: con IA configurada → pipeline RAG (IA decide,
+        busca en el vault y responde citando o con conocimiento propio); sin IA
+        → búsqueda KB directa clásica (kb_hit con el fragmento)."""
         speaker_raw = utterance.get("speaker", "Remote")
         side = infer_side(speaker_raw)
         text = utterance.get("text", "").strip()
@@ -149,7 +281,13 @@ class MeetingAuditor:
 
         evt_base = {"speaker": side, "speaker_raw": speaker_raw, "text": text, "ts": utterance.get("ts")}
         emit({**evt_base, "type": "enunciado"})
+        self._remember(side, text)
 
+        if self._ai_configured():
+            await self._process_with_ai(evt_base, side, text)
+            return
+
+        # --- Sin IA: búsqueda KB directa (comportamiento clásico) ---
         # 1) Buscar en KB
         kb_context = self._build_kb_context(utterance)
         if kb_context:
@@ -174,6 +312,28 @@ class MeetingAuditor:
         except Exception as e:
             log.warning(f"IA fallback error: {e}")
             emit({**evt_base, "type": "ai_error", "error": str(e)})
+
+    def _build_messages_for_ai(self, utterance: Dict, kb_context: Optional[Dict] = None) -> List[Dict]:
+        """Construye system+user para la tarea IA de fallback."""
+        side = utterance.get("speaker", "remote")
+        side_label = "el usuario (Tú)" if side == "you" else "la otra persona (Remoto)"
+        text = utterance.get("text", "")
+        system = (
+            "Eres un asistente de apoyo en una reunión técnica. Recibes un enunciado "
+            "y debes responder de forma breve y útil: aclarar, sugerir, corregir o dar "
+            "información relevante. Responde en español salvo que el tema sea ingés.Conserva tecnicismos."
+        )
+        user = f"Enunciado de {side_label}: \"{text}\""
+        if kb_context:
+            user += (
+                "\n\nContexto relevante de la base de conocimiento (puedes citarlo):\n"
+                + "\n".join(f"- {s['file_path']}: {s['answer'][:300]}" for s in [kb_context])
+            )
+        user += "\n\nDa una respuesta breve (máx 100 palabras) y accionable."
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
 
     # -- Realtime: vigilar un archivo de transcript creciente --
     async def watch_transcript(self, transcript_path: Path, poll_interval: float = 1.0) -> None:

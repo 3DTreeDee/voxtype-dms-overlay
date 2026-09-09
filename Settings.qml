@@ -185,4 +185,45 @@ PluginSettings {
         description: "Show meeting-mode controls (start / pause / resume / stop, ML diarization, open meetings folder) in the widget popout."
         defaultValue: false
     }
+
+    // ── Auditor: IA para responder preguntas (RAG) ──────────────────────────
+    StyledText {
+        width: parent.width
+        text: "Auditor IA (RAG)"
+        font.pixelSize: Theme.fontSizeLarge
+        font.weight: Font.Bold
+        color: Theme.surfaceText
+    }
+
+    StyledText {
+        width: parent.width
+        text: "Cuando está configurado, el auditor responde preguntas de ambos lados (Tú y Remoto) analizando la conversación, buscando en tu vault de Obsidian y, si no encuentra nada, respondiendo con su propio conocimiento. Sin configurar, funciona como hasta ahora (solo búsqueda por similitud en el vault)."
+        font.pixelSize: Theme.fontSizeSmall
+        color: Theme.surfaceVariantText
+        wrapMode: Text.WordWrap
+    }
+
+    StringSetting {
+        settingKey: "auditorAiBaseUrl"
+        label: "API base URL"
+        description: "Endpoint compatible con OpenAI. Ej: https://api.omniroute.ai/v1"
+        defaultValue: "https://api.omniroute.ai/v1"
+        placeholder: "https://api.omniroute.ai/v1"
+    }
+
+    StringSetting {
+        settingKey: "auditorAiModel"
+        label: "Modelo"
+        description: "Ej: gpt-4o-mini (rápido/barato) o gpt-4o (precisión)"
+        defaultValue: "gpt-4o-mini"
+        placeholder: "gpt-4o-mini"
+    }
+
+    StringSetting {
+        settingKey: "auditorAiApiKey"
+        label: "API key"
+        description: "Tu API key de OmniRoute/OpenAI — solo se guarda localmente y nunca aparece en procesos del sistema."
+        defaultValue: ""
+        placeholder: "sk-..."
+    }
 }
