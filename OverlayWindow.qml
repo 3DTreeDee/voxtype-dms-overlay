@@ -22,7 +22,9 @@ PanelWindow {
 
     // Modo auditor: en vez del dim full-screen (que taparía la reunión), se
     // muestra SOLO el panel flotante del feed del auditor en la esquina.
-    readonly property bool auditorMode: daemon && daemon.auditorEnabled && daemon.meetingRunning && daemon.active
+    // El feed del auditor se muestra cuando el interruptor está ON y hay una
+    // reunión en progreso. No requiere daemon.active (que es dictado ptt).
+    readonly property bool auditorMode: daemon && daemon.auditorEnabled && daemon.meetingRunning
 
     color: "transparent"
     visible: auditorMode || (daemon ? daemon.active : false)
