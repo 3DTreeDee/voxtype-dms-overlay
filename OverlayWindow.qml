@@ -34,10 +34,12 @@ PanelWindow {
     WlrLayershell.exclusiveZone: -1
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
 
-    // Input region = ONLY the ✕ button (when shown); everything else stays
-    // click-through, so the overlay never traps the pointer.
+    // Input region: en modo auditor el panel flotante captura la rueda/clics
+    // (para poder hacer scroll del feed); el resto sigue click-through. En
+    // dictado, solo el ✕ (cuando está habilitado).
     mask: Region {
-        item: (win.daemon && win.daemon.closeButtonEnabled) ? closeBtn : null
+        item: win.auditorMode ? auditorPanel
+             : (win.daemon && win.daemon.closeButtonEnabled) ? closeBtn : null
     }
 
     anchors {
@@ -241,8 +243,8 @@ PanelWindow {
         anchors.right: parent.right
         anchors.topMargin: 12
         anchors.rightMargin: 12
-        width: 420
-        height: Math.min(500, feed.implicitHeight + 20)
+        width: 460
+        height: Math.min(620, Math.max(300, feed.implicitHeight + 24))
 
         Rectangle {
             anchors.fill: parent
@@ -287,8 +289,9 @@ PanelWindow {
 
                 // Lista de eventos
                 Rectangle {
+                    id: qlistBox
                     width: parent.width
-                    height: Math.max(80, Math.min(360, qlist.implicitHeight))
+                    height: Math.max(80, Math.min(480, qlist.implicitHeight))
                     color: "transparent"
                     clip: true
 
@@ -297,7 +300,17 @@ PanelWindow {
                         anchors.fill: parent
                         model: win.auditor ? win.auditor.events : []
                         spacing: 10
-                        cacheBuffer: 200
+                        cacheBuffer: 400
+                        clip: true
+
+                        // Auto-scroll: mantener lo MÁS RECIENTE visible abajo.
+                        // (Sin esto los eventos nuevos quedan fuera de vista y
+                        // parecen "no llegar" — el bug que reportó el usuario.)
+                        onCountChanged: Qt.callLater(() => {
+                            if (qlist.contentHeight > qlist.height)
+                                qlist.positionViewAtEnd();
+                        })
+                        Component.onCompleted: Qt.callLater(() => qlist.positionViewAtEnd())
 
                         delegate: Item {
                             property var e: modelData
@@ -327,10 +340,10 @@ PanelWindow {
                                         spacing: 2
                                         StyledText {
                                             width: parent.width
-                                            text: (e.speaker === "you") ? "Tú" : (e.type === "ai_answer" || e.type === "kb_hit" ? "Auditor" : "Remoto")
+                                            text: (e.type === "kb_hit" || e.type === "ai_answer") ? "Auditor" : (e.speaker === "you") ? "Tú" : "Remoto"
                                             font.pixelSize: 10
                                             font.bold: true
-                                            color: Theme.surfaceVariantText
+                                            color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : (e.type === "ai_answer") ? Qt.rgba(0.45, 0.7, 1, 1) : Theme.surfaceVariantText
                                         }
                                         StyledText {
                                             id: txt
