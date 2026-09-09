@@ -39,5 +39,9 @@ if [[ ! -f "$STAMP" || "$(cat "$STAMP")" != "$REQ_HASH" ]]; then
     log "dependencias listas"
 fi
 
-# 3) Ejecutar el auditor con el python del venv
+# 3) Ejecutar el auditor con el python del venv.
+#    HF_HUB_OFFLINE=1: el modelo KB (all-MiniLM-L6-v2) ya está cacheado en
+#    ~/.cache/huggingface; sin esto cada arranque pierde 5-10s verificando
+#    online y puede perder los primeros segundos de voz del usuario.
+export HF_HUB_OFFLINE=1
 exec "$VENV_DIR/bin/python3" "$SCRIPT_DIR/auditor.py" "$@"

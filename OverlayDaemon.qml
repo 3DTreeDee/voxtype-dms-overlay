@@ -327,14 +327,15 @@ PluginComponent {
             Proc.runCommand("voxtypeOverlay.swapMeeting", swapCmd, (stdout, exitCode) => {}, 0);
         }
 
-        // 2) Lanzar el helper en modo `watch-json`: vigila el transcript.json
-        //    nativo de voxtype (auto-detecta la reunión activa más reciente).
-        //    (Opciones comunes --vault/--config van ANTES del subcomando en argparse.)
+        // 2) Lanzar el helper en modo `capture`: graba mic + loopback en chunks
+        //    y transcribe con `voxtype transcribe` (modelo residente → feed en
+        //    vivo). voxtype meeting NO escribe el transcript hasta el stop, así
+        //    que watch-json solo servía post-reunión; capture es el modo en vivo.
         auditorThread.stop();
         let args = [root.auditorScript()];
         if (root.auditorVault !== "")
             args = args.concat(["--vault", root.auditorVault]);
-        args = args.concat(["watch-json"]);
+        args = args.concat(["capture", "--chunk-secs", "6"]);
         auditorThread.commandModel = args;
         auditorThread.start();
     }

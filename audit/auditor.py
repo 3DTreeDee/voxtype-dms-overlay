@@ -274,6 +274,122 @@ class MeetingAuditor:
                     })
             await asyncio.sleep(poll_interval)
 
+    # -- Capture en vivo: grabar mic + loopback y transcribir con voxtype --
+    async def capture_live(self, chunk_secs: float = 6.0,
+                           mic_source: Optional[str] = None,
+                           loop_source: Optional[str] = None,
+                           vad_threshold: float = 0.003) -> None:
+        """Feed 100% en vivo: captura audio (mic → You, loopback → Remote),
+        transcribe cada chunk con `voxtype transcribe` (modelo residente en el
+        daemon de voxtype) y procesa los enunciados con KB/IA."""
+        from audio_capture import LiveCapture, _default_mic_source, _default_loopback_source
+
+        voxtype_bin = self._resolve_voxtype()
+        if not voxtype_bin:
+            log.error("voxtype no está en PATH; el modo capture lo necesita")
+            emit({"type": "ai_error", "speaker": "you", "text": "",
+                  "error": "voxtype CLI no encontrado en PATH"})
+            return
+
+        cap = LiveCapture(chunk_secs=chunk_secs,
+                          mic_source=mic_source or _default_mic_source(),
+                          loop_source=loop_source or _default_loopback_source(),
+                          vad_threshold=vad_threshold)
+        await cap.start()
+
+        log.info(f"Capture en vivo activo (chunk={chunk_secs}s, umbral VAD={vad_threshold})")
+        transcribe_tasks: Dict[str, asyncio.Task] = {}
+        last_finish: Dict[str, float] = {}   # dedupe: texto repetido en <2 chunks
+
+        try:
+            while True:
+                chunk = await cap.next_chunk()
+                if chunk is None:
+                    break
+                # Lanzar transcripción de mic y loop en paralelo
+                if chunk.mic_wav is not None:
+                    transcribe_tasks["you"] = asyncio.create_task(
+                        self._transcribe_and_process(
+                            voxtype_bin, chunk.mic_wav, "you", "You", last_finish))
+                if chunk.loop_wav is not None:
+                    transcribe_tasks["remote"] = asyncio.create_task(
+                        self._transcribe_and_process(
+                            voxtype_bin, chunk.loop_wav, "remote", "Remote", last_finish))
+                # Esperar a que terminen antes del siguiente chunk (evita GPU saturada)
+                if transcribe_tasks:
+                    done, pending = await asyncio.wait(
+                        transcribe_tasks.values(), timeout=chunk_secs + 20)
+                    for t in pending:
+                        t.cancel()
+                    transcribe_tasks = {k: v for k, v in transcribe_tasks.items()
+                                        if not v.done()}
+                    # limpiar tasks completadas
+                    transcribe_tasks = {}
+        finally:
+            await cap.stop()
+
+    @staticmethod
+    def _resolve_voxtype() -> Optional[str]:
+        import shutil
+        for cand in (shutil.which("voxtype"),
+                     str(Path.home() / ".local/bin/voxtype"),
+                     "/usr/bin/voxtype"):
+            if cand and os.path.exists(cand):
+                return cand
+        return None
+
+    async def _transcribe_and_process(self, voxtype_bin: str, wav: Path,
+                                      side: str, speaker_raw: str,
+                                      last_finish: Dict[str, float]) -> None:
+        """Transcribe un WAV con `voxtype transcribe` y procesa el enunciado."""
+        try:
+            text = await self._transcribe_wav(voxtype_bin, wav)
+        except Exception as e:
+            log.warning(f"Transcripción falló: {e}")
+            return
+        text = (text or "").strip()
+        if not text or len(text) < 2:
+            return
+        # Dedupe: mismo texto terminado hace <2*chunk (evita repetir por solape)
+        now = time.time()
+        if last_finish.get(side) and now - last_finish[side] < self.chunk_dedupe_secs:
+            return
+        last_finish[side] = now
+        log.info(f"[{side}] {text[:100]}")
+        await self.process_utterance({
+            "speaker": side,
+            "speaker_raw": speaker_raw,
+            "text": text,
+            "ts": int(now * 1000),
+        })
+
+    @property
+    def chunk_dedupe_secs(self) -> float:
+        return getattr(self, "_chunk_dedupe_secs", 8.0)
+
+    async def _transcribe_wav(self, voxtype_bin: str, wav: Path) -> str:
+        """Invoca `voxtype transcribe <wav>`; devuelve el texto transcrito.
+
+        voxtype imprime logs INFO coloreados (ANSI) a stdout; el texto real va
+        en la línea 'Transcription completed in Xs: "..."'. Cualquier otra cosa
+        (progreso, 'Model loaded', etc.) NO es transcripción: devolvemos ''.
+        """
+        import re
+        ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+        proc = await asyncio.create_subprocess_exec(
+            voxtype_bin, "transcribe", str(wav),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        text = ""
+        for raw in out.decode("utf-8", "replace").splitlines():
+            line = ansi_re.sub("", raw)  # quitar códigos de color
+            m = re.search(r'Transcription completed in .*?:\s*["“](.+?)["”]\s*$', line)
+            if m:
+                text = m.group(1).strip()
+        return text
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -293,6 +409,12 @@ async def main():
     p_watch_json.add_argument("transcript", nargs="?", default=None,
                               help="Path opcional a un transcript.json concreto")
     p_watch_json.add_argument("--poll", type=float, default=1.0)
+
+    p_capture = sub.add_parser("capture", help="Captura audio en vivo (mic+loopback) y transcribe con voxtype (feed 100% en vivo)")
+    p_capture.add_argument("--chunk-secs", type=float, default=6.0)
+    p_capture.add_argument("--mic-source", default=None, help="Source PipeWire del mic (default: source del sistema)")
+    p_capture.add_argument("--loop-source", default=None, help="Monitor del sink (default: monitor del sink por defecto)")
+    p_capture.add_argument("--vad-threshold", type=float, default=0.003)
 
     p_server = sub.add_parser("listen", help="Escuchar eventos via stdin (para el QML)")
 
@@ -333,6 +455,13 @@ async def main():
             auditor.ai = ai
             await auditor.watch_json(Path(args.transcript) if args.transcript else None,
                                      args.poll)
+    elif args.cmd == "capture":
+        async with OmniRouteClient(ai_cfg) as ai:
+            auditor.ai = ai
+            await auditor.capture_live(chunk_secs=args.chunk_secs,
+                                       mic_source=args.mic_source,
+                                       loop_source=args.loop_source,
+                                       vad_threshold=args.vad_threshold)
     elif args.cmd == "listen":
         # Modo server: leer JSON de enunciados por stdin
         async with OmniRouteClient(ai_cfg) as ai:
