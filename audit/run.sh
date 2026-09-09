@@ -20,9 +20,18 @@ try:
         ('auditorAiApiKey', 'OMNIROUTE_API_KEY'),
         ('auditorAiModel',  'OMNIROUTE_MODEL_KB'),
         ('auditorAutoReply', 'AUDITOR_AUTO_REPLY'),
+        ('auditorVaultSearch', 'AUDITOR_VAULT_SEARCH'),
+        ('auditorKbThreshold', 'AUDITOR_KB_THRESHOLD'),
     ]:
         val = v.get(k, '')
         if val:
+            # Convertir threshold de slider (entero 0-100) a float 0.0-1.0
+            if k == 'auditorKbThreshold':
+                try:
+                    pct = int(val)
+                    val = str(max(0, min(100, pct)) / 100.0)
+                except ValueError:
+                    val = '0.70'
             os.environ[e] = val
 except Exception:
     pass

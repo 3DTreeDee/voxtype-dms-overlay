@@ -102,6 +102,9 @@ class MeetingAuditor:
         self.max_len = self.config.get("max_utterance_len", 400)
         # Fase 3: toggle respuestas automáticas (default OFF — solo captions)
         self.auto_reply = bool(self.config.get("auto_reply", False))
+        # Fase 4/5: toggle vault search y umbral de similitud
+        self.vault_search = bool(self.config.get("vault_search", True))
+        self.kb_threshold = float(self.config.get("kb_threshold", 0.70))
         self._last_seen_text: Optional[str] = None  # para dedupe en modo realtime
         # Historial conversacional para el modo RAG con IA: los últimos
         # enunciados (lado + texto) que dan contexto a las referencias
@@ -204,16 +207,20 @@ class MeetingAuditor:
                 for r in results[:4])
             system = (
                 "Eres un asistente dentro de una reunión. El usuario te pide "
-                "información y tienes notas de su vault de Obsidian. Responde de "
-                "forma breve (máx 90 palabras) y accionable, en el idioma del "
-                "enunciado. Usa SOLO la información de las notas; si no responde "
-                "la pregunta, dilo y no inventes. Cita los archivos relevantes "
-                "al final como: Fuentes: nombre1.md, nombre2.md (solo nombres)."
+                "información. Tienes notas de su vault de Obsidian que PODRÍAN "
+                "ser relevantes. Evalúa si realmente responden la pregunta. "
+                "Si las notas son relevantes, responde citándolas (máx 90 "
+                "palabras) e incluye 'Fuentes: nombre1.md' al final. "
+                "Si las notas NO responden la pregunta o son irrelevantes, "
+                "IGNÓRALAS y responde con tu conocimiento general (pero "
+                "sin inventar datos del vault). Responde en el idioma del "
+                "enunciado."
             )
             user = (
                 f"Contexto de la reunión:\n{convo}\n\n"
                 f"{who}: \"{text}\"\n\n"
-                f"Notas relevantes del vault:\n{chunks}\n\nRespuesta:"
+                f"Notas del vault:\n{chunks}\n\n"
+                "Respuesta (si las notas no sirven, ignóralas):"
             )
         else:
             system = (
@@ -646,6 +653,155 @@ class MeetingAuditor:
             ask_watcher.cancel()
             await cap.stop()
 
+    # -- Live meeting: captions rápidos desde transcript.json de voxtype --
+    async def live_meeting(self, transcript_path: Optional[Path] = None,
+                           poll_interval: float = 0.5) -> None:
+        """Modo reunión en vivo: lee el transcript.json que voxtype genera
+        en tiempo real (segmentos cada ~2-3s) y los muestra como captions.
+        Push-to-ask: recibe comandos via ask.cmd, recolecta segmentos del
+        lapso de la pulsación (texto ya transcrito, sin grabar audio)."""
+        last_seen_id = -1
+        last_path: Optional[Path] = None
+        running_meeting = True
+        log.info("Modo live: vigilando transcript.json (captions rápidos + push-to-ask)")
+
+        # ── Push-to-ask: solo texto, sin pw-record ─────────────────────────
+        ask_dir = Path("/tmp/voxtype-auditor")
+        ask_cmd_file = ask_dir / "ask.cmd"
+        ask_dir.mkdir(parents=True, exist_ok=True)
+        self._ask_buffering = False
+        self._ask_start_id = -1   # último segment ID visto al presionar
+    
+        def _collect_ask_text(segments: List[Dict], since_id: int) -> str:
+            """Recolecta texto de segmentos con id > since_id."""
+            parts = []
+            for seg in segments:
+                try:
+                    sid = int(seg.get("id", -1))
+                except (TypeError, ValueError):
+                    continue
+                if sid > since_id:
+                    text = (seg.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+            return " ".join(parts) if parts else ""
+
+        async def _watch_ask_commands():
+            """Vigila ask.cmd cada 200ms: ask_start marca tiempo, ask_end
+            recolecta segmentos y ejecuta RAG."""
+            while running_meeting:
+                try:
+                    if ask_cmd_file.exists():
+                        cmd = ask_cmd_file.read_text("utf-8").strip().lower()
+                        if cmd.startswith("ask_start") and not self._ask_buffering:
+                            self._ask_buffering = True
+                            self._ask_start_id = last_seen_id
+                            log.info("🎤 Push-to-ask INICIO")
+                            emit({"type": "info", "msg": "🎤 Preguntando… habla ahora"})
+                        elif cmd.startswith("ask_end") and self._ask_buffering:
+                            self._ask_buffering = False
+                            log.info("🎤 Push-to-ask FIN — consultando IA…")
+                            emit({"type": "info", "msg": "💭 Pensando…"})
+                            # Esperar un poco para que lleguen segmentos pendientes
+                            await asyncio.sleep(1.5)
+                            # Recolectar texto de segmentos desde ask_start_id
+                            ask_text = ""
+                            if path and path.exists():
+                                try:
+                                    data = json.loads(path.read_text("utf-8"))
+                                    segs = data.get("segments", []) if isinstance(data, dict) else []
+                                    ask_text = _collect_ask_text(segs, self._ask_start_id)
+                                except Exception:
+                                    pass
+                            if not ask_text:
+                                log.info("Push-to-ask: sin segmentos nuevos")
+                                emit({"type": "info", "msg": "No se detectó voz durante la pulsación."})
+                            else:
+                                log.info(f"Push-to-ask: \"{ask_text[:120]}\"")
+                                evt_base = {"speaker": "you", "speaker_raw": "You",
+                                            "text": ask_text, "ts": int(time.time() * 1000)}
+                                await self._execute_ask_rag(evt_base, ask_text)
+                        if cmd:
+                            ask_cmd_file.write_text("")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+
+        async def _execute_ask_rag(evt_base: Dict, ask_text: str) -> None:
+            """Ejecuta RAG para push-to-ask: busca vault si está habilitado,
+            IA decide relevancia y responde."""
+            if self._ai_configured():
+                results = []
+                if self.vault_search:
+                    results = self.kb.search(ask_text, top_k=5, min_score=self.kb_threshold)
+                answer = await self._ai_answer("you", ask_text, results)
+                if answer and answer.strip():
+                    if results:
+                        emit({**evt_base, "type": "kb_hit",
+                              "sources": [{"file_path": r["file_path"],
+                                           "score": round(r["score"], 3)}
+                                          for r in results[:4]],
+                              "answer": answer.strip()[:900]})
+                    else:
+                        emit({**evt_base, "type": "ai_answer",
+                              "model": self.ai.config.get_model("kb_fallback").name,
+                              "answer": answer.strip()[:900]})
+            else:
+                # Sin IA: búsqueda KB directa
+                if self.vault_search:
+                    kb_result = self._build_kb_context({"text": ask_text})
+                    if kb_result:
+                        emit({**evt_base, "type": "kb_hit",
+                              "sources": kb_result["sources"],
+                              "answer": kb_result["answer"][:600]})
+                        return
+                emit({**evt_base, "type": "ai_error",
+                      "error": "IA no configurada y sin resultados del vault."})
+
+        # Arrancar watcher de push-to-ask
+        ask_watcher = asyncio.create_task(_watch_ask_commands())
+
+        try:
+            while running_meeting:
+                path = transcript_path
+                if path is None or not path.exists():
+                    path = self._find_active_transcript()
+                if path is not None and path.exists():
+                    if last_path != path:
+                        last_path = path
+                        last_seen_id = -1
+                        log.info(f"Transcript activo: {path}")
+                    try:
+                        data = json.loads(path.read_text("utf-8"))
+                        segments = data.get("segments", []) if isinstance(data, dict) else []
+                    except Exception:
+                        segments = []
+                    for seg in segments:
+                        try:
+                            sid = int(seg.get("id", -1))
+                        except (TypeError, ValueError):
+                            sid = -1
+                        if sid <= last_seen_id:
+                            continue
+                        text = (seg.get("text") or "").strip()
+                        if not text:
+                            last_seen_id = max(last_seen_id, sid)
+                            continue
+                        last_seen_id = max(last_seen_id, sid)
+                        source = seg.get("source", "microphone")
+                        speaker = seg.get("speaker_id") or (
+                            "You" if source == "microphone" else "Remote")
+                        # Emitir caption
+                        await self.process_utterance({
+                            "speaker": speaker,
+                            "ts": seg.get("start_ms"),
+                            "text": text,
+                        })
+                await asyncio.sleep(poll_interval)
+        finally:
+            ask_watcher.cancel()
+            log.info("Modo live finalizado")
+
     @staticmethod
     def _resolve_voxtype() -> Optional[str]:
         import shutil
@@ -734,6 +890,11 @@ async def main():
     p_capture.add_argument("--loop-source", default=None, help="Monitor del sink (default: monitor del sink por defecto)")
     p_capture.add_argument("--vad-threshold", type=float, default=0.003)
 
+    p_live = sub.add_parser("live", help="Modo reunión en vivo: lee transcript.json de voxtype (captions rápidos ~2-3s) + push-to-ask")
+    p_live.add_argument("transcript", nargs="?", default=None,
+                        help="Path opcional a un transcript.json concreto")
+    p_live.add_argument("--poll", type=float, default=0.5)
+
     p_server = sub.add_parser("listen", help="Escuchar eventos via stdin (para el QML)")
 
     common = parser.add_argument_group("Común")
@@ -762,7 +923,17 @@ async def main():
 
     ai_cfg = load_config_from_env_or_yaml(args.config)
     auto_reply = os.environ.get("AUDITOR_AUTO_REPLY", "").lower() in ("true", "1", "yes")
-    auditor = MeetingAuditor(kb, None, {"min_score": args.min_score, "auto_reply": auto_reply})
+    vault_search = os.environ.get("AUDITOR_VAULT_SEARCH", "true").lower() in ("true", "1", "yes")
+    try:
+        kb_threshold = float(os.environ.get("AUDITOR_KB_THRESHOLD", "0.70"))
+    except ValueError:
+        kb_threshold = 0.70
+    auditor = MeetingAuditor(kb, None, {
+        "min_score": args.min_score,
+        "auto_reply": auto_reply,
+        "vault_search": vault_search,
+        "kb_threshold": kb_threshold,
+    })
 
     if args.cmd == "replay":
         # Replay: usar IA async si se pide (transcripción ya guardada)
@@ -785,6 +956,12 @@ async def main():
                                        mic_source=args.mic_source,
                                        loop_source=args.loop_source,
                                        vad_threshold=args.vad_threshold)
+    elif args.cmd == "live":
+        async with OmniRouteClient(ai_cfg) as ai:
+            auditor.ai = ai
+            await auditor.live_meeting(
+                Path(args.transcript) if args.transcript else None,
+                args.poll)
     elif args.cmd == "listen":
         # Modo server: leer JSON de enunciados por stdin
         async with OmniRouteClient(ai_cfg) as ai:

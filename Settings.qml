@@ -277,6 +277,26 @@ PluginSettings {
         defaultValue: false
     }
 
+    // ── Búsqueda en vault (Fase 5) ─────────────────────────────────────────
+    ToggleSetting {
+        settingKey: "auditorVaultSearch"
+        label: "Buscar en vault de Obsidian"
+        description: "Cuando está ON, el auditor busca en tus notas de Obsidian antes de responder. Cuando está OFF, la IA responde solo con su conocimiento general."
+        defaultValue: true
+    }
+
+    SliderSetting {
+        settingKey: "auditorKbThreshold"
+        label: "Umbral de similitud del vault"
+        description: "Qué tan similar debe ser el resultado del vault para considerarlo relevante (0=relajado, 100=exigente). Recomendado: 70."
+        defaultValue: 70
+        minimum: 0
+        maximum: 100
+        unit: "%"
+        leftIcon: "unfold_less"
+        rightIcon: "unfold_more"
+    }
+
     StringSetting {
         settingKey: "auditorAiBaseUrl"
         label: "API base URL"

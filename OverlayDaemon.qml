@@ -335,21 +335,30 @@ PluginComponent {
             Proc.runCommand("voxtypeOverlay.swapMeeting", swapCmd, (stdout, exitCode) => {}, 0);
         }
 
-        // 2) Lanzar el helper en modo `capture`: graba mic + loopback en chunks
-        //    y transcribe con `voxtype transcribe` (modelo residente → feed en
-        //    vivo). voxtype meeting NO escribe el transcript hasta el stop, así
-        //    que watch-json solo servía post-reunión; capture es el modo en vivo.
-        auditorThread.stop();
-        let args = [root.auditorScript()];
-        if (root.auditorVault !== "")
-            args = args.concat(["--vault", root.auditorVault]);
-        args = args.concat(["capture", "--chunk-secs", "6"]);
-        auditorThread.commandModel = args;
-        auditorThread.start();
+        // 2) Arrancar voxtype meeting (transcripción continua → transcript.json)
+        Proc.runCommand("voxtypeOverlay.startMeeting", ["voxtype", "meeting", "start"],
+            (stdout, exitCode) => {}, 0, 10000);
+
+        // 3) Esperar ~2s a que transcript.json se cree, luego lanzar auditor en modo live
+        Qt.callLater(() => {
+            Qt.callLater(() => {
+                auditorThread.stop();
+                let args = [root.auditorScript()];
+                if (root.auditorVault !== "")
+                    args = args.concat(["--vault", root.auditorVault]);
+                args = args.concat(["live"]);
+                auditorThread.commandModel = args;
+                auditorThread.start();
+            });
+        });
     }
 
     function stopAuditor() {
         auditorThread.stop();
+
+        // Detener voxtype meeting
+        Proc.runCommand("voxtypeOverlay.stopMeeting", ["voxtype", "meeting", "stop"],
+            (stdout, exitCode) => {}, 0, 10000);
 
         // Revertir modelo al de dictado, si hicimos swap.
         if (root.auditorSwapModel) {
