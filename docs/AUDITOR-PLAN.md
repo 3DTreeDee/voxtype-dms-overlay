@@ -3,6 +3,14 @@
 > Estado: **acordado con el usuario** (2026-09-08). Cada fase termina con una
 > prueba end-to-end antes de pasar a la siguiente.
 
+## Estado
+
+- **Fase 1** ✅ Botón "Probar conexión" + estado en Settings ✓ (commit `03d0733`)
+- **Fase 2** ✅ Dropdown dinámico de modelos tras check exitoso ✓ (commit `cdbb32b`)
+- **Fase 3** ⬜ Captions en vivo durante la reunión
+- **Fase 4** ⬜ Push‑to‑ask con tecla + loopback
+- **Fase 5** ⬜ Pulido y registro
+
 ## Visión
 
 El auditor deja de "escuchar y responder" constantemente por ambos lados.

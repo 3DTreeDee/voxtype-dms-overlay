@@ -19,6 +19,7 @@ try:
         ('auditorAiBaseUrl', 'OMNIROUTE_BASE_URL'),
         ('auditorAiApiKey', 'OMNIROUTE_API_KEY'),
         ('auditorAiModel',  'OMNIROUTE_MODEL_KB'),
+        ('auditorAutoReply', 'AUDITOR_AUTO_REPLY'),
     ]:
         val = v.get(k, '')
         if val:

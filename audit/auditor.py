@@ -100,6 +100,8 @@ class MeetingAuditor:
         self.min_score = self.config.get("min_score", 0.35)
         self.kb_top_k = self.config.get("kb_top_k", 3)
         self.max_len = self.config.get("max_utterance_len", 400)
+        # Fase 3: toggle respuestas automáticas (default OFF — solo captions)
+        self.auto_reply = bool(self.config.get("auto_reply", False))
         self._last_seen_text: Optional[str] = None  # para dedupe en modo realtime
         # Historial conversacional para el modo RAG con IA: los últimos
         # enunciados (lado + texto) que dan contexto a las referencias
@@ -282,6 +284,11 @@ class MeetingAuditor:
         evt_base = {"speaker": side, "speaker_raw": speaker_raw, "text": text, "ts": utterance.get("ts")}
         emit({**evt_base, "type": "enunciado"})
         self._remember(side, text)
+
+        # Fase 3: si auto_reply está OFF, solo emitimos captions (sin IA/KB)
+        if not self.auto_reply:
+            log.debug(f"[{side}] caption-only: {text[:80]}")
+            return
 
         if self._ai_configured():
             await self._process_with_ai(evt_base, side, text)
@@ -603,7 +610,8 @@ async def main():
         kb.index_vault()
 
     ai_cfg = load_config_from_env_or_yaml(args.config)
-    auditor = MeetingAuditor(kb, None, {"min_score": args.min_score})
+    auto_reply = os.environ.get("AUDITOR_AUTO_REPLY", "").lower() in ("true", "1", "yes")
+    auditor = MeetingAuditor(kb, None, {"min_score": args.min_score, "auto_reply": auto_reply})
 
     if args.cmd == "replay":
         # Replay: usar IA async si se pide (transcripción ya guardada)

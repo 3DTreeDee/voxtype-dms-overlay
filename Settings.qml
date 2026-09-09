@@ -269,6 +269,14 @@ PluginSettings {
         wrapMode: Text.WordWrap
     }
 
+    // ── Respuestas automáticas (Fase 3) — default OFF, solo captions ──────
+    ToggleSetting {
+        settingKey: "auditorAutoReply"
+        label: "Respuestas automáticas"
+        description: "Cuando está OFF (default), el auditor SOLO muestra transcripción en vivo (closed captions) sin llamar a la IA. Cuando está ON, analiza cada enunciado automáticamente y responde preguntas buscando en el vault de Obsidian. Se recomienda mantenerlo OFF y activarlo solo cuando quieras respuestas sin preguntar explícitamente."
+        defaultValue: false
+    }
+
     StringSetting {
         settingKey: "auditorAiBaseUrl"
         label: "API base URL"
