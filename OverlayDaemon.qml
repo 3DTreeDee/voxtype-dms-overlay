@@ -4,6 +4,9 @@ import Quickshell.Io
 import qs.Common
 import qs.Modules.Plugins
 
+// Auditor components (same-dir QML used by the daemon).
+import "./auditor_components"
+
 // Root component of the "voxtypeOverlay" daemon plugin.
 //
 // A daemon-type PluginComponent is instantiated exactly ONCE (not per-screen),
@@ -259,6 +262,93 @@ PluginComponent {
             required property var modelData
             screen: modelData
             daemon: root
+            auditor: auditorThread
         }
+    }
+
+    // ── Auditor de reuniones (milestone 3) ────────────────────────────────────
+    // Live settings para el auditor (leídos de pluginData, refresh automático).
+    readonly property bool auditorEnabled: (pluginData && pluginData.auditorEnabled !== undefined) ? pluginData.auditorEnabled : false
+    readonly property bool auditorSwapModel: (pluginData && pluginData.auditorSwapModel !== undefined) ? pluginData.auditorSwapModel : true
+    readonly property string auditorModelMeeting: (pluginData && pluginData.auditorModelMeeting !== undefined && pluginData.auditorModelMeeting !== "") ? pluginData.auditorModelMeeting : "large-v3-turbo"
+    readonly property string auditorModelDictado: (pluginData && pluginData.auditorModelDictado !== undefined && pluginData.auditorModelDictado !== "") ? pluginData.auditorModelDictado : "small"
+    readonly property string auditorVault: (pluginData && pluginData.auditorVault !== undefined && pluginData.auditorVault !== "") ? pluginData.auditorVault : ""
+    readonly property string auditorScriptDir: (pluginData && pluginData.auditorScriptDir !== undefined && pluginData.auditorScriptDir !== "") ? pluginData.auditorScriptDir : ""
+
+    // Una sola fuente de verdad: `meetingRunning` lo sincroniza el widget via
+    // pluginData.auditorMeetingActive (mismo canal que el resto de config).
+    property bool meetingRunning: false
+
+    // Swap + arranque del auditor al ENTRAR en reunión; revertir + parar al salir.
+    onMeetingRunningChanged: {
+        if (meetingRunning) startAuditor();
+        else stopAuditor();
+    }
+
+    // Sincronizar `meetingRunning` desde pluginData (el widget lo escribe cuando
+    // detecta que una reunión empieza/termina).
+    onPluginDataChanged: {
+        if (pluginData && pluginData.auditorMeetingActive !== undefined)
+            root.meetingRunning = pluginData.auditorMeetingActive;
+    }
+
+    // Resolver path al script del auditor (el helper Python).
+    function auditorScript() {
+        if (root.auditorScriptDir !== "")
+            return root.auditorScriptDir + "/audit/auditor.py";
+        const home = Quickshell.env("HOME") || "";
+        return home + "/.config/DankMaterialShell/plugins/voxtypeOverlay/audit/auditor.py";
+    }
+
+    function swapScript() {
+        const py = root.auditorScript();
+        return py.replace(/\/audit\/auditor\.py$/, "/scripts/voxtype-model-swap.sh");
+    }
+
+    // El thread que vigila el auditor (levanta el helper, parsea JSONL).
+    AuditorThread {
+        id: auditorThread
+        autoStart: false
+    }
+
+    // El feed del auditor se integra dentro de OverlayWindow (PanelWindow ya
+    // registrado y mostrado por Variants más arriba) — le pasamos el thread.
+    // (Un PanelWindow nuevo `AuditorOverlay` no se registra como tipo en DMS
+    // sin reinstalar el plugin; reutilizar OverlayWindow evita ese problema.)
+
+    function startAuditor() {
+        if (!root.auditorEnabled) return;
+
+        // 1) Swap de modelo a reuniones, si habilitado (asíncrono, fire-and-forget).
+        if (root.auditorSwapModel) {
+            const swapCmd = ["bash", root.swapScript(), "reunion",
+                             root.auditorModelMeeting, root.auditorModelDictado];
+            Proc.runCommand("voxtypeOverlay.swapMeeting", swapCmd, (stdout, exitCode) => {}, 0);
+        }
+
+        // 2) Lanzar el helper en modo `listen` (recibe enunciados por stdin; el
+        //    widget/daemon los inyecta vía feedUtterance). Así no dependemos del
+        //    formato del transcript en disco.
+        auditorThread.stop();
+        let args = [root.auditorScript(), "listen"];
+        if (root.auditorVault !== "")
+            args = args.concat(["--vault", root.auditorVault]);
+        auditorThread.commandModel = args;
+        auditorThread.start();
+    }
+
+    function stopAuditor() {
+        auditorThread.stop();
+
+        // Revertir modelo al de dictado, si hicimos swap.
+        if (root.auditorSwapModel) {
+            const swapCmd = ["bash", root.swapScript(), "revert"];
+            Proc.runCommand("voxtypeOverlay.swapRevert", swapCmd, (stdout, exitCode) => {}, 0);
+        }
+    }
+
+    function setAuditorEnabled(v) {
+        if (typeof pluginService !== "undefined" && pluginService)
+            pluginService.savePluginData(pluginId, "auditorEnabled", v);
     }
 }

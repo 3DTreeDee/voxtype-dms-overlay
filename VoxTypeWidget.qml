@@ -27,6 +27,8 @@ PluginComponent {
     readonly property bool widgetAutoPaste: (pluginData && pluginData.widgetAutoPaste !== undefined) ? pluginData.widgetAutoPaste : false
     readonly property bool engineSwitcherEnabled: (pluginData && pluginData.engineSwitcherEnabled !== undefined) ? pluginData.engineSwitcherEnabled : true
     readonly property bool meetingEnabled: (pluginData && pluginData.meetingEnabled !== undefined) ? pluginData.meetingEnabled : false
+    // Auditor toggle state (read live from pluginData; written by setAuditorEnabled).
+    readonly property bool auditorEnabled_: (pluginData && pluginData.auditorEnabled !== undefined) ? pluginData.auditorEnabled : false
 
     PluginGlobalVar {
         id: voxStateGlobal
@@ -60,6 +62,11 @@ PluginComponent {
             meetingStarting = false;
         else
             meetingQuickMode = false;
+
+        // Sync con el daemon: escribir pluginData.auditorMeetingActive para que
+        // el OverlayDaemon (que lo lee) dispare startAuditor()/stopAuditor().
+        if (typeof pluginService !== "undefined" && pluginService)
+            pluginService.savePluginData(pluginId, "auditorMeetingActive", meetingActive);
     }
     // Pill pulses while dictating, or while a meeting is actively running.
     readonly property bool pillPulsing: recording || (meetingActive && !meetingPaused)
@@ -97,6 +104,11 @@ PluginComponent {
     function setOverlayEnabled(on) {
         if (pluginService)
             pluginService.savePluginData(pluginId, "overlayEnabled", on);
+    }
+    // Toggle del auditor: activa/desactiva el análisis en vivo + swap de modelo.
+    function setAuditorEnabled(on) {
+        if (pluginService)
+            pluginService.savePluginData(pluginId, "auditorEnabled", on);
     }
 
     // ── Config-mutating actions (section-aware editor, then restart) ───────────
@@ -832,6 +844,50 @@ PluginComponent {
                             cursorShape: Qt.PointingHandCursor
                             onClicked: root.meetingDispatch(modelData.act)
                         }
+                    }
+                }
+
+                // ── Auditor switch (toggle dentro del bloque de reunión) ──────
+                // Activa/desactiva el auditor: análisis en vivo de ambos lados +
+                // swap automático de modelo al entrar en reunión.
+                Rectangle {
+                    width: parent.width
+                    height: root._rowH
+                    radius: Theme.cornerRadius
+                    color: auditorRowMouse.containsMouse ? Theme.primaryHoverLight : "transparent"
+                    Behavior on color { ColorAnimation { duration: Theme.shorterDuration; easing.type: Theme.standardEasing } }
+                    Row {
+                        anchors.left: parent.left; anchors.leftMargin: Theme.spacingM + 26
+                        anchors.right: parent.right; anchors.rightMargin: Theme.spacingM
+                        anchors.verticalCenter: parent.verticalCenter; spacing: Theme.spacingS
+                        DankIcon { name: "psychology"; size: 16; color: root.auditorEnabled_ ? Theme.primary : Theme.surfaceText; anchors.verticalCenter: parent.verticalCenter }
+                        StyledText {
+                            text: "Auditor"
+                            font.pixelSize: Theme.fontSizeNormal - 1
+                            color: root.auditorEnabled_ ? Theme.primary : Theme.surfaceText
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Item { width: 8; height: 1 }
+                        // Toggle visual sencillo
+                        Rectangle {
+                            width: 34; height: 20; radius: 10
+                            color: root.auditorEnabled_ ? Theme.primary : Theme.surfaceVariant
+                            anchors.verticalCenter: parent.verticalCenter
+                            Rectangle {
+                                width: 16; height: 16; radius: 8
+                                color: "white"
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.left: parent.left; anchors.leftMargin: root.auditorEnabled_ ? 16 : 2
+                                Behavior on anchors.leftMargin { NumberAnimation { duration: 120 } }
+                            }
+                        }
+                    }
+                    MouseArea {
+                        id: auditorRowMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.setAuditorEnabled(!root.auditorEnabled_)
                     }
                 }
 

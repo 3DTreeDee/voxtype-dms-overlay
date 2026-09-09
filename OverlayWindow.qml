@@ -18,9 +18,14 @@ PanelWindow {
     id: win
 
     property var daemon
+    property var auditor
+
+    // Modo auditor: en vez del dim full-screen (que taparía la reunión), se
+    // muestra SOLO el panel flotante del feed del auditor en la esquina.
+    readonly property bool auditorMode: daemon && daemon.auditorEnabled && daemon.meetingRunning && daemon.active
 
     color: "transparent"
-    visible: daemon ? daemon.active : false
+    visible: auditorMode || (daemon ? daemon.active : false)
 
     WlrLayershell.namespace: "voxtype-overlay"
     WlrLayershell.layer: WlrLayershell.Overlay
@@ -51,14 +56,14 @@ PanelWindow {
         anchors.fill: parent
         color: "black"
         opacity: win.daemon ? win.daemon.dimOpacity : 0
-        visible: !win.isCutScreen && !win.micOnly
+        visible: !win.isCutScreen && !win.micOnly && !win.auditorMode
     }
 
     // ── Four-rectangle dim frame around the active-window cutout ─────────────
     Item {
         id: frame
         anchors.fill: parent
-        visible: win.isCutScreen && !win.micOnly
+        visible: win.isCutScreen && !win.micOnly && !win.auditorMode
 
         readonly property int cx: win.daemon ? win.daemon.cutX : 0
         readonly property int cy: win.daemon ? win.daemon.cutY : 0
@@ -220,6 +225,143 @@ PanelWindow {
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: if (win.daemon) win.daemon.cancelRecording()
+        }
+    }
+
+    // ── Auditor feed panel (esquina superior derecha) ────────────────────────
+    // Se muestra SOLO en modo auditor (reunión activa + auditor on). Sustituye
+    // el dim full-screen: lista los enunciados de ambos lados y las respuestas
+    // del KB/IA del auditor en tiempo real.
+    Item {
+        id: auditorPanel
+        visible: win.auditorMode
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.topMargin: 12
+        anchors.rightMargin: 12
+        width: 420
+        height: Math.min(500, feed.implicitHeight + 20)
+
+        Rectangle {
+            anchors.fill: parent
+            radius: 14
+            color: Qt.rgba(0.11, 0.11, 0.13, 0.92)
+            border.width: 1
+            border.color: Qt.rgba(1, 1, 1, 0.12)
+
+            Column {
+                id: feed
+                anchors.fill: parent
+                anchors.margins: 12
+                spacing: 8
+
+                // Cabecera
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    DankIcon {
+                        anchors.verticalCenter: parent.verticalCenter
+                        name: "groups"
+                        size: 16
+                        color: Theme.primary
+                    }
+                    StyledText {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Auditor — Reunión en vivo"
+                        font.pixelSize: 14
+                        font.bold: true
+                        color: Theme.surfaceText
+                        elide: Text.ElideRight
+                        width: parent.width - 30
+                    }
+                }
+                StyledText {
+                    text: "Enunciados de ambos lados · respuestas KB/IA"
+                    font.pixelSize: 11
+                    color: Theme.surfaceVariantText
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                }
+
+                // Lista de eventos
+                Rectangle {
+                    width: parent.width
+                    height: Math.max(80, Math.min(360, qlist.implicitHeight))
+                    color: "transparent"
+                    clip: true
+
+                    ListView {
+                        id: qlist
+                        anchors.fill: parent
+                        model: win.auditor ? win.auditor.events : []
+                        spacing: 10
+                        cacheBuffer: 200
+
+                        delegate: Item {
+                            property var e: modelData
+                            width: ListView.view.width
+                            height: rowC.implicitHeight + 14
+
+                            Column {
+                                id: rowC
+                                anchors.left: parent.left
+                                anchors.leftMargin: 2
+                                anchors.right: parent.right
+                                anchors.rightMargin: 2
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 6
+
+                                Row {
+                                    width: parent.width
+                                    spacing: 6
+                                    Rectangle {
+                                        width: 6
+                                        height: txt.implicitHeight
+                                        radius: 3
+                                        color: (e.speaker === "you") ? Theme.primary : Qt.rgba(0.9, 0.6, 0.2, 0.9)
+                                    }
+                                    Column {
+                                        width: parent.width - 12
+                                        spacing: 2
+                                        StyledText {
+                                            width: parent.width
+                                            text: (e.speaker === "you") ? "Tú" : (e.type === "ai_answer" || e.type === "kb_hit" ? "Auditor" : "Remoto")
+                                            font.pixelSize: 10
+                                            font.bold: true
+                                            color: Theme.surfaceVariantText
+                                        }
+                                        StyledText {
+                                            id: txt
+                                            width: parent.width
+                                            text: e.text || ""
+                                            font.pixelSize: 13
+                                            color: Theme.surfaceText
+                                            wrapMode: Text.WordWrap
+                                        }
+                                    }
+                                }
+
+                                StyledText {
+                                    width: parent.width
+                                    visible: e.type === "kb_hit" || e.type === "ai_answer"
+                                    text: (e.type === "kb_hit" ? "📚 " : "💡 ") + (e.answer || "")
+                                    font.pixelSize: 12
+                                    color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : Qt.rgba(0.45, 0.7, 1, 1)
+                                    wrapMode: Text.WordWrap
+                                }
+                                StyledText {
+                                    width: parent.width
+                                    visible: e.type === "ai_error"
+                                    text: "⚠️ " + (e.error || "")
+                                    font.pixelSize: 11
+                                    color: Theme.errorText
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
