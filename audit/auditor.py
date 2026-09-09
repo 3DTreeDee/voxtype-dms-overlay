@@ -218,6 +218,62 @@ class MeetingAuditor:
             if utt.get("text"):
                 await self.process_utterance(utt)
 
+    # -- Watch del transcript.json nativo de voxtype (formato JSON segments[]) --
+    @staticmethod
+    def _find_active_transcript() -> Optional[Path]:
+        """Devuelve el transcript.json más reciente de ~/.local/share/voxtype/meetings."""
+        base = Path.home() / ".local/share/voxtype/meetings"
+        if not base.exists():
+            return None
+        cands = sorted(base.glob("*/transcript.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        return cands[0] if cands else None
+
+    async def watch_json(self, transcript_path: Optional[Path],
+                         poll_interval: float = 1.0) -> None:
+        """Vigila el transcript.json nativo de voxtype (segments[]), procesando
+        segments nuevos (id creciente). Si no se da path, auto-detecta el
+        transcript más reciente (la reunión activa)."""
+        last_seen_id = -1
+        last_path: Optional[Path] = None
+        log.info(f"Vigilando transcript.json (auto-detect activo: {transcript_path is None})")
+        while True:
+            path = transcript_path
+            if path is None or not path.exists():
+                path = self._find_active_transcript()
+            if path is not None and path.exists():
+                # Si cambió de archivo (nueva reunión), resetear dedupe
+                if last_path != path:
+                    last_path = path
+                    last_seen_id = -1
+                    log.info(f"Transcript activo: {path}")
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    segments = data.get("segments", []) if isinstance(data, dict) else []
+                except Exception:
+                    segments = []
+                for seg in segments:
+                    try:
+                        sid = int(seg.get("id", -1))
+                    except (TypeError, ValueError):
+                        sid = -1
+                    if sid <= last_seen_id:
+                        continue
+                    text = (seg.get("text") or "").strip()
+                    if not text:
+                        last_seen_id = max(last_seen_id, sid)
+                        continue
+                    last_seen_id = max(last_seen_id, sid)
+                    source = seg.get("source", "microphone")
+                    speaker = seg.get("speaker_id") or (
+                        "You" if source == "microphone" else "Remote")
+                    await self.process_utterance({
+                        "speaker": speaker,
+                        "ts": seg.get("start_ms"),
+                        "text": text,
+                    })
+            await asyncio.sleep(poll_interval)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -232,6 +288,11 @@ async def main():
     p_watch = sub.add_parser("watch", help="Vigilar un transcript creciente en vivo")
     p_watch.add_argument("transcript")
     p_watch.add_argument("--poll", type=float, default=1.0)
+
+    p_watch_json = sub.add_parser("watch-json", help="Vigilar el transcript.json nativo de voxtype (auto-detecta reunión activa)")
+    p_watch_json.add_argument("transcript", nargs="?", default=None,
+                              help="Path opcional a un transcript.json concreto")
+    p_watch_json.add_argument("--poll", type=float, default=1.0)
 
     p_server = sub.add_parser("listen", help="Escuchar eventos via stdin (para el QML)")
 
@@ -267,6 +328,11 @@ async def main():
         async with OmniRouteClient(ai_cfg) as ai:
             auditor.ai = ai
             await auditor.watch_transcript(Path(args.transcript), args.poll)
+    elif args.cmd == "watch-json":
+        async with OmniRouteClient(ai_cfg) as ai:
+            auditor.ai = ai
+            await auditor.watch_json(Path(args.transcript) if args.transcript else None,
+                                     args.poll)
     elif args.cmd == "listen":
         # Modo server: leer JSON de enunciados por stdin
         async with OmniRouteClient(ai_cfg) as ai:

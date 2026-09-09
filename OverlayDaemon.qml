@@ -303,7 +303,7 @@ PluginComponent {
 
     function swapScript() {
         const py = root.auditorScript();
-        return py.replace(/\/audit\/auditor\.py$/, "/scripts/voxtype-model-swap.sh");
+        return py.replace(/\/audit\/run\.sh$/, "/scripts/voxtype-model-swap.sh");
     }
 
     // El thread que vigila el auditor (levanta el helper, parsea JSONL).
@@ -327,17 +327,16 @@ PluginComponent {
             Proc.runCommand("voxtypeOverlay.swapMeeting", swapCmd, (stdout, exitCode) => {}, 0);
         }
 
-        // 2) Lanzar el helper en modo `listen` (recibe enunciados por stdin; el
-                //    widget/daemon los inyecta vía feedUtterance). Así no dependemos del
-                //    formato del transcript en disco.
-                //    (Opciones comunes --vault/--config van ANTES del subcomando en argparse.)
-                auditorThread.stop();
-                let args = [root.auditorScript()];
-                if (root.auditorVault !== "")
-                    args = args.concat(["--vault", root.auditorVault]);
-                args = args.concat(["listen"]);
-                auditorThread.commandModel = args;
-                auditorThread.start();
+        // 2) Lanzar el helper en modo `watch-json`: vigila el transcript.json
+        //    nativo de voxtype (auto-detecta la reunión activa más reciente).
+        //    (Opciones comunes --vault/--config van ANTES del subcomando en argparse.)
+        auditorThread.stop();
+        let args = [root.auditorScript()];
+        if (root.auditorVault !== "")
+            args = args.concat(["--vault", root.auditorVault]);
+        args = args.concat(["watch-json"]);
+        auditorThread.commandModel = args;
+        auditorThread.start();
     }
 
     function stopAuditor() {
