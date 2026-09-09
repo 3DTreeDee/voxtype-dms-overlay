@@ -1,123 +1,140 @@
-# Handoff: Auditor de Reuniones — Documentación para OpenCode
+# Handoff: Auditor de Reuniones — Estado desde OpenCode
 
-> Documentado: 2026-09-09 (~04:40 local)
-> Repo: `~/Proyectos/GitHub/voxtype-dms-overlay`, rama `feat/auditor-meetings`
-> Plugin: `~/.config/DankMaterialShell/plugins/voxtypeOverlay/`
-> Skill: `dms-voxtype-plugins` cargada en Hermes
+> Documentado: 2026-09-09 ~07:50 local (sesión de ~3h en OpenCode)
+> Rama: `feat/auditor-meetings`
+> Repo: `~/Proyectos/GitHub/voxtype-dms-overlay`
+> Plugin installed: `~/.config/DankMaterialShell/plugins/voxtypeOverlay/` (copias, NO symlink)
+> Binario externo: `~/.local/bin/voxtype-export-mtg`
 
-## Estado actual
+## 1. ESTADO ACTUAL ✅/❌
 
-### ✅ Funciona
-- **whisper-server 8177** (Vulkan, large-v3-turbo) — transcribe multipart en ~0.6s/request
-- **Selector de fuentes desde el widget** (Settings > Plugins > VoxType Recording Overlay): mic y loop fijos, con "Refrescar dispositivos"
-- **El mic BT se filtró** del dropdown de micrófono (solo webcam/USB + System default)
-- **Prioridad temporal del mic** en `audio_capture.py`: si el mic detecta voz, el loop no se transcribe (sidetone HFP) — ver rediseño 7.9
-- **Dedupe textual secundario** en `auditor.py` (ventana 12s): si el "Tú" dijo el texto antes que "Remoto", el remoto se descarta
-- **Idioma español** (`language=es` en whisper-server)
-- **Fix backlog del lector**: lectura limitada a ~0.4s/iteración (antes leía todo el backlog → frases de 109s de golpe)
-- **Fix hora local en exportaciones**: `voxtype-export-mtg` reescribe UTC → hora local (-05)
+### ✅ Funciona (todo probado end-to-end)
+- **Remote capture con BT** — `pw-record -P '{ stream.capture.sink=true node.target=<sink> }'` en vez de `--target <monitor>`. PipeWire re-ruteaba el monitor BT al source por defecto (webcam). Fix aplicado en `audio_capture.py::_pw_record_start` y `auditor.py::_start_ask_buffer`.
+- **Push-to-ask "Preguntar"** — marcadores separados `ask_start`/`ask_end` (touch, sin truncado). Watcher tracking por índice (`ask_start_idx`) espera hasta 8s a que la frase se cierre VAD + whisper. Antes usaba un solo `ask.cmd` que perdía comandos por carrera y pw-record separado que PipeWire no alimentaba.
+- **Vault_search toggle** — `run.sh` exporta correctamente `AUDITOR_VAULT_SEARCH=false` usando `eval + print('export VAR=val')` por stdout. Anteriormente: `os.environ[e]=val` dentro de `python3 -c` no salía del hijo python al shell padre → siempre `true`.
+- **Modelo IA** — `omniroute_client.get_model` respeta `auto/best-chat` del widget (línea 82, usa `default_models[task]` como fallback). Antes hardcodeaba `gpt-4o-mini` → router respondía "no active credentials for openai".
+- **Circuit breaker** — `_end_ask_rag` usa `safe_results = results if self.vault_search else []` para que ni `results` espurios generen 📚 si vault está OFF.
+- **5 gates `vault_search`** — todas las emisiones `kb_hit` están gateadas. Verificar con `grep vault_search auditor.py`.
+- **Orphan pw-record killer** — `LiveCapture.start()` mata cualquier pw-record apuntando a su tmp_dir antes de arrancar.
+- **PID-unique WAVs** — `session_{run_id:06d}_{seq:05d}_{tag}.wav` y `phrase_{run_id:06d}_{seq:05d}_{ts}_{tag}.wav` — dos auditor.py nunca colisionan.
+- **Graceful shutdown** — handler SIGTERM/SIGINT en `capture_live` → `cap.stop()` mata hijos pw-record.
+- **session_log** — `MeetingAuditor.session_log` captura enunciados (ts exacto VAD) + respuestas IA. Se escribe como `/tmp/voxtype-auditor/session_transcript.json` al finalizar `capture_live`.
+- **voxtype-export-mtg** — prefiere `session_transcript.json` con timestamps `[mm:ss.ms]` e incluye respuestas IA. Fallback al export de voxtype.
+- **Scrolling corregido** — `OverlayWindow.qml:onCountChanged` usa `Qt.callLater(() => qlist.positionViewAtEnd())` (ya no está invertido).
+- **Botón pregunta feedback** — eventos info relevantes (ask/IA) aparecen en feed como líneas sutiles centradas; `AuditorThread._isRelevantInfo` filtra.
 
-### ❌ No funciona (causa raíz encontrada)
-**Problema principal**: `pw-record --target bluez_output.84_AC_60_12_A9_31.1.monitor` NO captura el monitor — PipeWire lo re-rutea a la webcam (Source 52) incluso con el monitor en estado RUNNING.
-- **Evidencia**: 3 pw-record independientes apuntando al monitor BT, todos conectados a `webcamproduct:capture_MONO`
-- **Consecuencia**: session_mic.wav y session_loop.wav son **byte-por-byte idénticos** (mismo contenido PCM)
-- **Efecto en el feed**: "Remoto" nunca aparece aunque haya audio reproduciéndose por los audífonos
+### ❌ Bugs pendientes
+1. **Primera frase perdida** — el arranque del capture tarda ~2s más que el botón de reunión. La primera frase que dices se pierde. Posible fix: pre-arrancar `LiveCapture` en idle al abrir el panel del auditor, o arrancar el capture antes de notificar al widget.
+2. **Basura visual del feed anterior** — al iniciar una nueva reunión, el feed arrastra texto de la reunión anterior. `AuditorThread.events` no se limpia en `start()`. Fix: agregar `root.events = []` en `AuditorThread.start()`.
+3. **Frase final corrupta** — caracteres raros como "Toðallos mírs…" en WM_STATUS/IME. Ocurre cuando el widget deja el IME/teclado virtual abierto. No es del auditor; es de VoxType o del widget cuando la reunión termina y el overlay reaparece.
+4. **(Menor) Scroll invertido en Settings** — en la UI de Settings.qml, el scroll del feed sube en vez de bajar. No afecta al feed del overlay (que funciona bien).
 
-### ✅ Bugs menores resueltos en OpenCode
-1. **7.3 — Botón "Preguntar"** — arreglado: `get_model()` respeta `auto/best-chat` del widget (antes hardcodeaba `gpt-4o-mini`); el protocolo ask.cmd de archivo único con carrera ahora usa marcadores separados `ask_start`/`ask_end` con `touch` sin truncado; el watcher maneja ambos en el mismo poll. Feedback visual: eventos info relevantes (ask/IA) aparecen en el feed como líneas sutiles centradas.
+## 2. HALLAZGOS CRÍTICOS (lecciones aprendidas)
 
-### ❌ Bugs menores pendientes
-2. **Primera frase perdida** — arranque del capture ~2s más lento que el botón (pre-arrancar al abrir panel?)
-3. **Scroll invertido** — el feed sube en vez de bajar con cada frase nueva (QML/Settings)
-4. **Basura visual del feed anterior** — al iniciar nueva reunión, el feed arrastra texto de la anterior
-5. **Frase final corrupta** — caracteres raros como "Toðallos mírs…" (posible IME/UTF-8 en el widget)
+### Bug #1 — run.sh: las env vars NUNCA llegaban al proceso
+- **Código original**: `python3 -c "import os; os.environ['VAR']='val'"` — el `os.environ` solo modifica el proceso hijo python, no el bash padre. Al salir python3, todas las variables se pierden.
+- **Fix**: `eval "$(python3 -c 'print("export VAR=val")')"` — python imprime exports que bash evalúa **antes del exec**.
+- **Historia**: Hermes Agent implementó el run.sh original y nunca funcionó. `auditorAiApiKey`, `auditorVaultSearch`, `auditorAiModel` jamás llegaron al proceso. El modelo siempre caía a default `gpt-4o-mini`, vault asumía `true`, API key no se seteaba → IA fallaba → 📚 siempre.
 
-## Solución documentada para el problema del monitor BT
+### Bug #2 — Backticks `` ` `` en inline python rompen bash
+- **Código original**: `python3 -c "...`val`... '`val` puede ser bool'..."` — los backticks hacen command substitution de bash dentro de las dobles comillas. Bash ejecutaba `val` e `if val:` como comandos → el bloque python fallaba silenciosamente.
+- **Fix**: eliminar backticks de los comentarios (usar comillas simples o ninguna).
 
-### Opción A (recomendada): `pw-record -P stream.capture.sink=true`
-Fuente: https://stackoverflow.com/questions/78065207
+### Bug #3 — get_model hardcodeaba gpt-4o-mini
+- `omniroute_client.py::get_model(task)` sin catálogo YAML (`self.models = {}`) devolvía `ModelConfig(name="gpt-4o-mini")` ignorando `default_models[task]`.
+- El router OmniRoute responde `No active credentials for provider: openai` para `gpt-4o-mini` → la IA fallaba → el pipeline caía al `else` que hacía `_build_kb_context` sin gate → 📚.
+- **Fix**: cuando `self.models` está vacío y `model_name` de `default_models` no está en catálogo, usar el nombre directamente.
 
-```bash
-# Captura lo que suena en el sink BT sin usar el monitor source
-pw-record -P '{ stream.capture.sink=true node.target=bluez_output.84_AC_60_12_A9_31.1 }' \
-  --rate 16000 --channels 1 --format s16 --latency 50ms /tmp/salida.wav
-```
+### Bug #4 — Carrera en protocolo ask.cmd
+- Un solo archivo `ask.cmd` sobreescrito con `echo -n > ask.cmd`. `onPressed` (async mkdir + callback) y `onReleased` podían colisionar: si sueltas antes de que se escriba `ask_start`, el watcher nunca lo ve; si ambos caen en el mismo ciclo de poll, `ask_end` se procesa con `_ask_buffering=False` y se descarta.
+- **Fix**: marcadores separados `ask_start`/`ask_end` con `touch` (sin truncado, sin carrera).
 
-La flag `stream.capture.sink=true` le dice a PipeWire que capture el *playback* del sink en vez del monitor source, lo que evita el bug de routing.
+### Bug #5 — Orphan pw-record + session file collision
+- Cuando el daemon mata auditor.py (SIGKILL o `proc.running=false`), los hijos pw-record sobreviven y siguen escribiendo el mismo `session_00001_*.wav`. 3 generaciones de huérfanos escribiendo al mismo archivo → audio corrupto → frases de Remote nunca se cierran.
+- **Fix**: (a) PID en nombres de archivo, (b) startup killer de orphans, (c) handler SIGTERM que deriva a `cap.stop()`.
 
-### Opción B: `pw-loopback` como source virtual persistente
-```bash
-pw-loopback \
-  --capture-props='{ stream.capture.sink=true node.target=bluez_output.84_AC_60_12_A9_31.1 }' \
-  --playback-props='{ media.class=Audio/Source node.name=voxtype-loop-bt }'
-```
-Esto crea un source virtual (`voxtype-loop-bt`) que siempre captura el sink BT. Luego se graba con:
-```bash
-pw-record --target voxtype-loop-bt --rate 16000 --channels 1 --format s16 ...
-```
+### Bug #6 — pw-record separado para push-to-ask no funciona
+- PipeWire no alimenta dos capturas de la misma fuente. El VAD principal ya tiene el source → el segundo pw-record del ask recibe silencio → WAVs vacíos → "no se detectó voz".
+- **Fix**: usar las frases ya transcritas por el VAD principal (`self._spoken`) durante la pulsación.
 
-## Prueba simple sugerida por el usuario (antes de tocar BT)
+### Bug #7 — Timestamps de voxtype son chunks fijos de 30s
+- voxtype genera segmentos en bloques de 30s (`chunk_duration_secs = 30`), NO por VAD. El transcript.json se escribe al hacer stop, no en tiempo real.
+- El auditor captura con timestamps exactos de VAD (ms). Se guarda en `session_transcript.json` y `voxtype-export-mtg` lo prefiere.
 
-1. **Desconectar audífonos BT**, usar altavoces del monitor/PC
-2. Mic fijo = webcam (ya está en settings)
-3. Loop = "Monitor of …" del sink activo (el HDMI/analógico de los altavoces)
-4. Reproducir un video de YouTube
-5. Iniciar reunión desde el widget
+## 3. ARQUITECTURA ACTUAL
 
-**Lo que debería pasar**: el audio de YouTube sale por los altavoces → el monitor del sink lo captura → aparece como "Remoto" en el feed. Tu voz por la webcam → "Tú". Esta prueba valida TODO el pipeline (VAD, transcripción, feed, prioridad temporal) sin la complejidad del BT.
+### Flujo de inicio de reunión (OverlayDaemon.qml -> startAuditor)
+1. `voxtype meeting start` — inicia grabación de voxtype (respaldo completo, chunks de 30s)
+2. Tras 2s, lanza `auditor.py capture ...` vía `AuditorThread`
+3. `run.sh` exporta env vars (eval + print), luego exec `auditor.py`
+4. `auditor.py capture` arranca `whisper-server` si no está, luego `LiveCapture` (pw-record continuo por lado)
+5. Lector VAD cierra frases, las transcribe con whisper, emite eventos JSONL
+6. `AuditorThread` recibe eventos, los muestra en el feed (OverlayWindow)
+7. Botón Preguntar → marcadores ask_start/ask_end → watcher recolecta `_spoken` + IA
+8. Al detener: SIGTERM → `finally` → `cap.stop()` → matar pw-record → escribir `session_transcript.json`
 
-Si funciona, luego se implementa la Opción A o B para el BT.
+### Archivos clave
+| Archivo | Rol |
+|---------|-----|
+| `audit/audio_capture.py` | LiveCapture: pw-record continuo, VAD, cierre de frases |
+| `audit/auditor.py` | Orquestador: transcripción whisper, RAG, push-to-ask, session_log |
+| `audit/omniroute_client.py` | Cliente IA con get_model, retry, timeout |
+| `audit/run.sh` | Exporta env vars del widget al proceso auditor |
+| `audit/kb_index.py` | Embeddings del vault, búsqueda semántica |
+| `OverlayDaemon.qml` | Coordinador: inicia/para el auditor, maneja overlay visual |
+| `OverlayWindow.qml` | Feed visual del auditor + botón Preguntar |
+| `auditor_components/AuditorThread.qml` | Proceso + SplitParser + cola de eventos |
+| `Settings.qml` | UI de configuración (audio, IA, vault) |
+| `~/.local/bin/voxtype-export-mtg` | Exporta reunión a vault (prefiere session_transcript.json) |
 
-## Código relevante
-
-### `audio_capture.py` (~/repo/audit/)
-- `LiveCapture.__init__`: `_mic_voice_at`, `_mic_suppress_secs = 2.0`
-- `_feed_side`: actualiza `_mic_voice_at` en cada ventana de voz del mic (línea 416)
-- `_close_side`: el loop se descarta si mic voz hace <2s (línea ~455-462)
-- `_pw_record_start`: usa `pw-record --target <source> ...`
-- `_watch_side`: lector con chunking limitado a 0.4s (fix backlog)
-
-**Para implementar Opción A**: cambiar `_pw_record_start` para el lado loop a:
-```python
-if tag == "loop":
-    cmd = [pw, "-P", '{ stream.capture.sink=true node.target=%s }' % src,
-           "--rate", str(rate), "--channels", "1",
-           "--format", "s16", "--latency", "50ms", str(out)]
-```
-donde `src` sería `bluez_output.84_AC_60_12_A9_31.1` (el sink, no el monitor).
-
-### `auditor.py` (~/repo/audit/)
-- `_transcribe`: recepción de frases → speaker "you" o "remote"
-- `_has_recent`: red secundaria (texto duplicado ≤12s se descarta)
-- `WhisperHTTP`: cliente multipart para whisper-server
-
-### `Settings.qml`
-- Selector de mic: filtra `bluez_input`
-- Selector de loop: muestra sinks + sus monitores (pendiente adaptar a `stream.capture.sink=true`)
-
-## Config actual del usuario
+### Config actual del usuario (plugin_settings.json -> voxtypeOverlay)
 ```json
 {
-  "auditorMicSource": "alsa_input.usb-webcamvendor_webcamproduct_YGR80PU1200...mono-fallback",
+  "auditorMicSource": "alsa_input.usb-webcamvendor_webcamproduct_...mono-fallback",
   "auditorLoopSource": "bluez_output.84_AC_60_12_A9_31.1.monitor",
   "auditorAiBaseUrl": "http://localhost:20128/v1",
   "auditorAiModel": "auto/best-chat",
   "auditorAutoReply": false,
-  "auditorVaultSearch": true,
-  "auditorKbThreshold": 70
+  "auditorVaultSearch": false,
+  "auditorKbThreshold": 93
 }
 ```
-API key → [REDACTED]
+API key en plugin_settings.json (no visible en comando).
 
-## Últimos commits
+## 4. QUÉ SIGUE (tareas para mañana)
+
+### Prioridad Alta
+1. **Fix primera frase perdida** — el capture arranca ~2s después del botón. La primera frase que dices se pierde porque los pw-record no están grabando todavía. Opciones:
+   - Pre-arrancar `LiveCapture` en modo idle cuando se abre el panel del auditor (antes de presionar "Iniciar reunión")
+   - O arrancar el capture y esperar a que los pw-record estén activos antes de decirle al widget que la reunión empezó
+   - O hacer que el daemon arranque el capture antes de `voxtype meeting start`
+
+2. **Fix basura visual del feed anterior** — `AuditorThread.qml` no limpia `events` al arrancar. Agregar `root.events = []` al inicio de `start()` (línea ~89). También limpiar `daemon._spoken = []` en `startAuditor` del daemon.
+
+3. **Frase final corrupta** — investigar si es del widget de VoxType (reaparece al terminar reunión) o del IME. Verificar si cerrar el teclado virtual al finalizar la reunión lo soluciona. Si es del overlay, el fix está en OverlayWindow, no en el auditor.
+
+### Prioridad Media
+4. **ScrollSettings invertido** — en `Settings.qml`, la vista previa del feed tiene scroll invertido (se va arriba). Es de la UI de settings, no del feed real. Bajo impacto.
+
+5. **Commit de voxtype-export-mtg** — está fuera del repo (en ~/.local/bin). Considerar moverlo al repo en `scripts/` y hacer que el daemon lo instale/symlinkee.
+
+6. **Push a origin** — la rama `feat/auditor-meetings` tiene commits locales sin push. Hacer `git push origin feat/auditor-meetings` para respaldo.
+
+### Consideraciones técnicas
+- El plugin instalado en `~/.config/DankMaterialShell/plugins/voxtypeOverlay/` es una **copia**, no symlink al repo. Los cambios QML hay que copiarlos manualmente (`cp OverlayWindow.qml ...`). Los cambios Python corren desde el repo via run.sh.
+- Después de copiar QML, recargar con `dms ipc plugin-scan reload voxtypeOverlay` o reiniciar DMS.
+- `__pycache__` en el directorio instalado puede causar que corra código viejo. Limpiar con `rm -rf .../__pycache__` y opcionalmente `find ... -name '*.pyc' -delete`.
+
+## 5. ÚLTIMOS COMMITS
 ```
+c4e893d feat(auditor): session_log guarda transcript exacto en session_transcript.json
+2459cf9 fix(auditor): push-to-ask funcional + vault_search obedece al widget
+76c47c9 fix(auditor): captura remoto BT con stream.capture.sink + mata huérfanos pw-record
 43fbf4d fix(auditor): rediseño anti-sidetone — prioridad temporal del mic (7.9)
 c23fd13 fix(auditor): anti-sidetone HFP — buffer 1.2s + prioridad al mic (7.5)
-48d934d fix(daemon): flags --mic-source/--loop-source van DESPUÉS de 'capture'
-b7e07c0 feat(settings): sección audio en GUI + fuentes fijas + red anti-eco
 ```
 
-## Referencias externas
+## 6. REFERENCIAS
 - [PipeWire: capturar sink con pw-record](https://stackoverflow.com/questions/78065207) — flag `stream.capture.sink=true`
 - [ArchWiki PipeWire/Examples](https://wiki.archlinux.org/index.php/PipeWire/Examples) — loopback, null-sink, echo-cancel
 - [PipeWire props docs](https://docs.pipewire.org/devel/page_man_pipewire-props_7.html) — `stream.capture.sink`
