@@ -48,18 +48,14 @@ current_model() {
 }
 
 save_state() {
-    cat > "$STATE_FILE" <<JSON
-{
-  "previous": $(echo "$1" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip()))'),
-  "current": "$(current_model)",
-  "updated_at": $(date +%s)
-}
-JSON
+    # Escribe JSON de una sola codificación. "$1" = modelo previo (texto plano).
+    python3 -c 'import json,sys,time; json.dump({"previous": sys.argv[1], "current": sys.argv[2], "updated_at": int(time.time())}, open(sys.argv[3], "w"))' \
+        "$1" "$(current_model)" "$STATE_FILE"
 }
 
 load_previous() {
     if [[ -f "$STATE_FILE" ]]; then
-        python3 -c "import json,sys;print(json.load(open('$STATE_FILE')).get('previous','null'))" 2>/dev/null || echo "null"
+        python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get("previous"); print(v if v else "null")' "$STATE_FILE" 2>/dev/null || echo "null"
     else
         echo "null"
     fi
@@ -110,26 +106,32 @@ set_model() {
 
 case "${1:-}" in
     dictado)
+        # Fuerza el modelo de dictado (opcional: $2 = modelo).
+        [[ -n "${2:-}" ]] && MODEL_DICTADO="$2"
         echo "{\"mode\":\"dictado\",\"model\":\"$MODEL_DICTADO\"}"
-        save_state "$(current_model | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip()))')"
         set_model "$MODEL_DICTADO"
         ;;
     reunion)
+        # $2 = modelo de reunión, $3 = modelo de dictado (guardado para revert).
+        [[ -n "${2:-}" ]] && MODEL_REUNION="$2"
+        [[ -n "${3:-}" ]] && MODEL_DICTADO="$3"
         echo "{\"mode\":\"reunion\",\"model\":\"$MODEL_REUNION\"}"
-        save_state "$(current_model | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read().strip()))')"
+        # Guarda el modelo actual (texto plano) para poder revertir.
+        save_state "$(current_model)"
         set_model "$MODEL_REUNION"
         ;;
     revert)
-        local prev
-        prev=$(load_previous)
-        if [[ "$prev" == "null" ]]; then
-            info "Sin estado previo; usando modelo de dictado."
+        prev="$(load_previous)"
+        if [[ -z "$prev" || "$prev" == "null" ]]; then
+            info "Sin estado previo; usando modelo de dictado ($MODEL_DICTADO)."
             set_model "$MODEL_DICTADO"
+        elif [[ "$(current_model)" == "$prev" ]]; then
+            info "Ya en el modelo previo ($prev); nada que revertir."
         else
             info "Revirtiendo a modelo previo: $prev"
             set_model "$prev"
-            rm -f "$STATE_FILE"
         fi
+        rm -f "$STATE_FILE"
         ;;
     status)
         echo "Modelo activo: $(current_model)"

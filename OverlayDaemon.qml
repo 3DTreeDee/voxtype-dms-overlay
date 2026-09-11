@@ -269,7 +269,12 @@ PluginComponent {
     // ── Auditor de reuniones (milestone 3) ────────────────────────────────────
     // Live settings para el auditor (leídos de pluginData, refresh automático).
     readonly property bool auditorEnabled: (pluginData && pluginData.auditorEnabled !== undefined) ? pluginData.auditorEnabled : false
-    readonly property bool auditorSwapModel: (pluginData && pluginData.auditorSwapModel !== undefined) ? pluginData.auditorSwapModel : true
+    // Swap de modelo OFF por defecto: cambiarlo ejecuta `systemctl restart
+    // voxtype`, y como el widget YA arrancó la reunión, el restart la MATA
+    // (la ventana del auditor aparece y desaparece). Las captions en vivo del
+    // auditor usan su propio whisper-server (large-v3-turbo) independiente del
+    // `whisper.model` de voxtype; el respaldo de voxtype queda con `small`.
+    readonly property bool auditorSwapModel: (pluginData && pluginData.auditorSwapModel !== undefined) ? pluginData.auditorSwapModel : false
     readonly property string auditorModelMeeting: (pluginData && pluginData.auditorModelMeeting !== undefined && pluginData.auditorModelMeeting !== "") ? pluginData.auditorModelMeeting : "large-v3-turbo"
     readonly property string auditorModelDictado: (pluginData && pluginData.auditorModelDictado !== undefined && pluginData.auditorModelDictado !== "") ? pluginData.auditorModelDictado : "small"
     // auditorVault: null/undefined/"" en pluginData → "" (default del helper:
@@ -299,10 +304,31 @@ PluginComponent {
     }
 
     // Sincronizar `meetingRunning` desde pluginData (el widget lo escribe cuando
-    // detecta que una reunión empieza/termina).
+    // detecta que una reunión empieza/termina). La PRIMERA vez reconciliamos
+    // contra el estado real de voxtype: si el flag quedó pegado en `true` por
+    // una reunión interrumpida (DMS matado a mitad), el panel del auditor se
+    // mostraría durante el dictado normal con el feed viejo.
+    property bool meetingReconciled: false
     onPluginDataChanged: {
         if (pluginData && pluginData.auditorMeetingActive !== undefined)
             root.meetingRunning = pluginData.auditorMeetingActive;
+        if (!root.meetingReconciled && pluginData && pluginData.auditorMeetingActive !== undefined) {
+            root.meetingReconciled = true;
+            root.reconcileMeetingState();
+        }
+    }
+
+    function reconcileMeetingState() {
+        Proc.runCommand("voxtypeOverlay.meetingReconcile", ["voxtype", "meeting", "status"],
+            (out, exit) => {
+                const t = (out || "").trim();
+                const active = (exit === 0) && t !== "" && t.indexOf("no meeting currently in progress") === -1;
+                if (!active && root.meetingRunning) {
+                    root.meetingRunning = false;
+                    if (typeof pluginService !== "undefined" && pluginService)
+                        pluginService.savePluginData(pluginId, "auditorMeetingActive", false);
+                }
+            }, 0, 5000);
     }
 
     // Resolver path al launcher del auditor (run.sh: gestiona venv propio,
@@ -333,19 +359,18 @@ PluginComponent {
     function startAuditor() {
         if (!root.auditorEnabled) return;
 
-        // 1) Swap de modelo a reuniones, si habilitado (asíncrono, fire-and-forget).
-        if (root.auditorSwapModel) {
-            const swapCmd = ["bash", root.swapScript(), "reunion",
-                             root.auditorModelMeeting, root.auditorModelDictado];
-            Proc.runCommand("voxtypeOverlay.swapMeeting", swapCmd, (stdout, exitCode) => {}, 0);
-        }
+        // NO se hace swap de modelo aquí: cambiar `whisper.model` ejecuta
+        // `systemctl restart voxtype`, y como el widget ya arrancó la reunión,
+        // el restart la mata → la ventana aparece y desaparece. Las captions en
+        // vivo usan el whisper-server propio del auditor (large-v3-turbo), así
+        // que el modelo de dictado de voxtype se queda intacto (`small`).
 
-        // 2) Arrancar voxtype meeting (grabación COMPLETA de respaldo → transcript.json
+        // 1) Arrancar voxtype meeting (grabación COMPLETA de respaldo → transcript.json
         //    al hacer stop; es la que se exporta/indexa para RAG)
         Proc.runCommand("voxtypeOverlay.startMeeting", ["voxtype", "meeting", "start"],
             (stdout, exitCode) => {}, 0, 10000);
 
-        // 3) Esperar ~2s, luego lanzar el auditor en modo capture (Fase 6):
+        // 2) Esperar ~2s, luego lanzar el auditor en modo capture (Fase 6):
         //    captions por fin-de-frase vía whisper-server HTTP persistente
         //    (el propio auditor arranca whisper-server si no está corriendo).
         Qt.callLater(() => {
@@ -374,17 +399,20 @@ PluginComponent {
         // Detener voxtype meeting
         Proc.runCommand("voxtypeOverlay.stopMeeting", ["voxtype", "meeting", "stop"],
             (stdout, exitCode) => {}, 0, 10000);
-
-        // Revertir modelo al de dictado, si hicimos swap.
-        if (root.auditorSwapModel) {
-            const swapCmd = ["bash", root.swapScript(), "revert"];
-            Proc.runCommand("voxtypeOverlay.swapRevert", swapCmd, (stdout, exitCode) => {}, 0);
-        }
     }
 
     function setAuditorEnabled(v) {
         if (typeof pluginService !== "undefined" && pluginService)
             pluginService.savePluginData(pluginId, "auditorEnabled", v);
+    }
+
+    // Auto-scroll del feed del auditor: ON = el feed queda pegado abajo con
+    // cada frase nueva; OFF = scroll libre (no salta). Persistido en pluginData.
+    readonly property bool auditorAutoScroll: (pluginData && pluginData.auditorAutoScroll !== undefined) ? pluginData.auditorAutoScroll : true
+
+    function setAuditorAutoScroll(v) {
+        if (typeof pluginService !== "undefined" && pluginService)
+            pluginService.savePluginData(pluginId, "auditorAutoScroll", !!v);
     }
 
     // ── Persistencia del panel del auditor (tamaño/posición) ─────────────────

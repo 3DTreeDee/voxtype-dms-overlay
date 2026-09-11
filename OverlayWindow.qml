@@ -33,6 +33,10 @@ PanelWindow {
     property bool auditorCollapsed: false
     property bool auditorHidden: false
 
+    // Auto-scroll del feed: ON = pegado abajo (siempre lo más reciente);
+    // OFF = scroll libre, sin saltos. Persistido en pluginData (daemon).
+    readonly property bool autoScrollFeed: (daemon && daemon.auditorAutoScroll !== undefined) ? daemon.auditorAutoScroll : true
+
     // Cada reunión nueva: re-aplicar geometría guardada (el Item solo se crea
     // una vez al cargar el plugin) y resetear colapso/oculto.
     onAuditorModeChanged: {
@@ -52,6 +56,12 @@ PanelWindow {
             auditorPanel.y = (d.auditorPanelY >= 0) ? Math.min(d.auditorPanelY, win.height - 32)
                                                     : Math.max(12, (win.height - dh) * 0.08);
         });
+    }
+
+    // Al reactivar el auto-scroll, bajar de inmediato al final.
+    onAutoScrollFeedChanged: {
+        if (autoScrollFeed)
+            Qt.callLater(() => { if (qlist) qlist.positionViewAtEnd(); });
     }
 
     color: "transparent"
@@ -459,6 +469,37 @@ PanelWindow {
                         onClicked: win.auditorCollapsed = true
                     }
                 }
+
+                // Botón auto-scroll (switch): ON = feed pegado abajo; OFF = scroll
+                // libre sin saltos. A la izquierda del colapsar.
+                Rectangle {
+                    id: autoScrollBtn
+                    anchors.right: collapseBtn.left
+                    anchors.rightMargin: 6
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 30
+                    height: 30
+                    radius: 7
+                    color: win.autoScrollFeed
+                           ? Qt.rgba(0.35, 0.8, 0.5, 0.30)
+                           : (autoScrollMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : "transparent")
+                    DankIcon {
+                        anchors.centerIn: parent
+                        name: win.autoScrollFeed ? "vertical_align_bottom" : "swap_vert"
+                        size: 16
+                        color: win.autoScrollFeed ? Qt.rgba(0.5, 0.95, 0.65, 1) : Theme.surfaceVariantText
+                    }
+                    MouseArea {
+                        id: autoScrollMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (win.daemon && win.daemon.setAuditorAutoScroll)
+                                win.daemon.setAuditorAutoScroll(!win.autoScrollFeed);
+                        }
+                    }
+                }
             }
 
             // ── Lista del feed: espacio entre cabecera y botón ────────────────
@@ -482,12 +523,24 @@ PanelWindow {
                     clip: true
                     boundsBehavior: Flickable.StopAtBounds
 
-                    // Auto-scroll: mantener lo MÁS RECIENTE visible abajo.
-                    onCountChanged: Qt.callLater(() => {
-                        if (qlist.contentHeight > qlist.height)
+                    // Auto-scroll condicionado por el switch del panel:
+                    //  - ON  → pegado abajo (siempre lo más reciente).
+                    //  - OFF → scroll libre, no se mueve al llegar texto.
+                    // (a) onCountChanged: entró una frase/evento nuevo.
+                    // (b) onContentHeightChanged: el layout creció/ajustó (la
+                    //     altura del delegate no está medida al llegar el evento;
+                    //     sin esto el scroll quedaba a medias y luego "saltaba").
+                    // Doble callLater para posicionar tras medir el delegate.
+                    function scrollToBottom() {
+                        if (win.autoScrollFeed && qlist.count > 0)
                             qlist.positionViewAtEnd();
+                    }
+                    onCountChanged: Qt.callLater(() => {
+                        scrollToBottom();
+                        Qt.callLater(scrollToBottom);
                     })
-                    Component.onCompleted: Qt.callLater(() => qlist.positionViewAtEnd())
+                    onContentHeightChanged: Qt.callLater(scrollToBottom)
+                    Component.onCompleted: Qt.callLater(scrollToBottom)
 
                     delegate: Item {
                         property var e: modelData

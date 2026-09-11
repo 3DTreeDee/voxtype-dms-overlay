@@ -98,6 +98,9 @@ Item {
         proc.running = false;
         root.running = false;
         root.status = "stopped";
+        // No arrastrar el feed de la reunión anterior (evita que texto viejo
+        // reaparezca en el panel si se vuelve a abrir).
+        root.events = [];
     }
 
     function restart() {
