@@ -499,15 +499,9 @@ class MeetingAuditor:
 
         # Motor de transcripción: whisper-server persistente. Si no puede
         # arrancar, caemos a `voxtype transcribe` (lento pero funcional).
+        # Arranca el servidor en paralelo con la captura: el primer audio
+        # queda grabado por pw-record/VAD mientras el modelo carga en VRAM.
         whisper = WhisperHTTP(url=whisper_url)
-        ok = await whisper.ensure()
-        if not ok:
-            log.warning("whisper-server no disponible — usando voxtype transcribe (lento)")
-            emit({"type": "info",
-                  "msg": "⚠️ Motor whisper-server no disponible; usando voxtype (más lento)"})
-        self._whisper = whisper
-        self._transcribe_engine = whisper if ok else None
-
         cap = LiveCapture(mic_source=mic_source or _default_mic_source(),
                           loop_source=loop_source or _default_loopback_source(),
                           vad_threshold=vad_threshold,
@@ -536,7 +530,23 @@ class MeetingAuditor:
             except (NotImplementedError, RuntimeError):
                 pass
 
-        await cap.start()
+        whisper_ready = asyncio.create_task(whisper.ensure())
+        try:
+            await cap.start()
+            try:
+                ok = await whisper_ready
+            except Exception as e:
+                log.warning(f"whisper-server no disponible — usando voxtype transcribe (lento): {e}")
+                ok = False
+        finally:
+            if not whisper_ready.done():
+                whisper_ready.cancel()
+        if not ok:
+            log.warning("whisper-server no disponible — usando voxtype transcribe (lento)")
+            emit({"type": "info",
+                  "msg": "⚠️ Motor whisper-server no disponible; usando voxtype (más lento)"})
+        self._whisper = whisper
+        self._transcribe_engine = whisper if ok else None
 
         log.info(f"Capture por frases activo (silencio≥{min_silence_secs}s, "
                  f"tope={max_phrase_secs}s, umbral VAD={vad_threshold})")

@@ -1,6 +1,6 @@
 # Bugs y deuda técnica — Auditor de reuniones
 
-> Actualizado: 2026-09-10 (sesión OpenCode)
+> Actualizado: 2026-09-11 (sesión OpenCode, Fase 0)
 > Rama: `feat/auditor-meetings`
 > Base: `docs/AUDITOR-PLAN.md` (fases 1-7) y `docs/HANDOFF-OPENGODE.md`
 > Objetivo de este doc: lista viva de bugs abiertos + evidencia, para retomar
@@ -10,8 +10,8 @@
 
 | ID  | Sev   | Bug | Estado |
 |-----|-------|-----|--------|
-| B01 | Alta  | Primera frase perdida al iniciar reunión | Abierto |
-| B02 | Alta  | Alucinación `"Gracias."` en silencio | **Abierto (nuevo)** |
+| B01 | Alta  | Primera frase perdida al iniciar reunión | Fix aplicado, validar |
+| B02 | Alta  | Alucinación `"Gracias."` en silencio | Abierto (rollback tras prueba 2026-09-11) |
 | B03 | Alta  | Anti-sidetone 7.9 (voz propia como "Remoto") | Fix aplicado, validar |
 | B04 | Media | Frase corrupta al cierre (IME/teclado virtual) | Abierto |
 | B05 | Media | Feed arrastra texto viejo / aparece en dictado | Mitigado, validar |
@@ -23,40 +23,42 @@
 
 ## 2. Detalle
 
-### B01 — Primera frase perdida al iniciar reunión · Alta · Abierto
+### B01 — Primera frase perdida al iniciar reunión · Alta · Fix aplicado, validar
 - **Síntoma**: la primera frase que dices tras pulsar "Iniciar reunión" no
   aparece en el feed.
-- **Causa**: `OverlayDaemon.startAuditor()` espera ~2 s (`Qt.callLater` doble,
-  `OverlayDaemon.qml:377`) antes de lanzar `auditor.py capture`; los `pw-record`
-  aún no graban.
-- **Fix propuesto**: pre-arrancar `LiveCapture` en idle al abrir el panel, o
-  esperar a que los `pw-record` estén activos antes de confirmar el inicio.
+- **Causa**: la señal de la reunión llegaba después del poll de estado, el
+  respaldo y Python se arrancaban en serie, y `whisper.ensure()` bloqueaba la
+  captura mientras el modelo cargaba en VRAM.
+- **Fix aplicado**: el widget avisa de forma optimista al pulsar iniciar (con
+  apagado automático si la reunión no se activa); el daemon arranca primero el
+  auditor y en paralelo el respaldo de `voxtype meeting`; `capture_live`
+  arranca `pw-record`/VAD mientras `whisper-server` carga en segundo plano.
+- **Pendiente**: prueba en vivo hablando inmediatamente al pulsar iniciar.
 
-### B02 — Alucinación `"Gracias."` en silencio · Alta · Abierto (NUEVO)
-- **Síntoma**: estando en silencio, el feed muestra `"Gracias."`.
-- **Evidencia** (sesión `run_id=436512`, `/tmp/voxtype-auditor/session_transcript.json`):
+### B02 — Alucinación `"Gracias."` en silencio · Alta · Abierto (rollback 2026-09-11)
+- **Síntoma previo**: estando en silencio, el feed mostraba `"Gracias."`.
+- **Evidencia previa** (sesión `run_id=436512`, `/tmp/voxtype-auditor/session_transcript.json`):
   | WAV | duración | RMS | transcripción |
   |---|---|---|---|
   | `phrase_436512_00011_1789098942723_mic.wav` | 0.30 s | **149** | "Gracias." |
   | `phrase_436512_00015_1789098992793_mic.wav` | 1.19 s | **128** | "Gracias." |
-  Habla normal = RMS 450-1200. Estos clips son ruido/silencio (RMS ≈ 0.004 en
-  escala 0-1).
-- **Causa raíz**:
-  1. `audio_capture.py` usa `vad_threshold = 0.003` (`audio_capture.py:217`) y
-     mínimo de frase 250 ms (`audio_capture.py:508`) → el ruido de fondo cruza
-     el umbral y genera "frases" vacías.
-  2. `whisper-server` se arranca sin filtros anti-alucinación
-     (`auditor.py:1096`); con audio casi mudo Whisper alucina `"Gracias."`
-     (patrón típico en español).
-- **Fix propuesto** (de menor a mayor esfuerzo):
-  1. Subir `vad_threshold` a ~0.010-0.015 y/o exigir mínimo de energía sostenida
-     y mínimo de frase mayor (~500 ms).
-  2. Arrancar `whisper-server` con `-sns` (`--suppress-nst`) y `-nth 0.8`
-     (`--no-speech-thold`); ambos existen en el binario instalado.
-  3. Filtro post-transcripción: descartar si RMS del clip es bajo **y** el texto
-     está en una lista de alucinaciones conocidas ("Gracias.", "Thank you.",
-     "Subtítulos realizados por…").
-  4. (Opcional) `--vad` con Silero (`ggml-silero-v5.1.2.bin`, no instalado).
+  Habla normal anterior = RMS 450-1200. Estos clips son ruido/silencio
+  (RMS ≈ 0.004 en escala 0-1).
+- **Causa raíz probable**:
+  1. El VAD previo usa `vad_threshold = 0.003` y mínimo de frase 250 ms → el
+     ruido de fondo puede cruzar el umbral y generar "frases" vacías.
+  2. `whisper-server` se arranca sin filtros anti-alucinación; con audio casi
+     mudo Whisper puede alucinar `"Gracias."` (patrón típico en español).
+- **Intento revertido**: umbral `0.012`, voz mínima `0.3 s`, frase mínima
+  `0.5 s`, servidor con `--suppress-nst`/`--no-speech-thold 0.8`, y filtro
+  exacto de alucinaciones cortas y débiles.
+- **Por qué se revirtió**: en la prueba en vivo del 2026-09-11, con el umbral
+  alto se perdieron frases reales del micrófono (voz de baja energía), el
+  push-to-ask dejó de recibir voz y el `"Gracias."` final correspondía a un
+  fragmento audible de 1.11 s, no a silencio. El rollback devuelve el VAD
+  previo y deja este ajuste como fine-tuning final.
+- **Pendiente**: calibración adaptativa por energía del micrófono, sin romper
+  la detección de voz baja.
 
 ### B03 — Anti-sidetone 7.9 (voz propia sale como "Remoto") · Alta · Validar
 - **Fix aplicado**: regla temporal en `audio_capture.py` — si el loop cierra

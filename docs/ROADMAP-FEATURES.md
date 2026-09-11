@@ -73,15 +73,16 @@ propio (vault Obsidian / OpenNotebook) + local + gratis + extensible.**
 
 ## 4. Línea base actual (revisar antes de tocar)
 
-- Fases 1-6 ✅, Fase 7 a medias. Bugs abiertos: **B01** (primera frase perdida,
-  Alta), **B02** (alucinación "Gracias." en silencio, Alta), B03 (anti-sidetone
+- Fases 1-6 ✅, Fase 7 a medias. Estado actual: **B01** con fix aplicado y pendiente
+  de validación en vivo; **B02** con intento de umbral agresivo revertido tras
+  fallar en vivo y pendiente de calibración adaptativa; B03 (anti-sidetone
   pendiente de validar en vivo), B04 (frase corrupta al cierre), B05 (feed
   arrastra texto viejo, mitigado), B06 (latencia push-to-ask), B07-B08 menores.
-- **1 commit local sin push** (`fd0c02d`). ⇒ Primer paso en OpenCode: push.
-- Verificar que el plugin instalado en
-  `~/.config/DankMaterialShell/plugins/voxtypeOverlay/` es **symlink** al repo
-  (OpenCode afirma que sí; confirmar con `ls -l`) — si es copia, los cambios QML
-  no hot-reload.
+- Antes de Sprint 1: hacer un **commit local pequeño de Fase 0**; no hacer push
+  salvo solicitud explícita.
+- El plugin instalado en
+  `~/.config/DankMaterialShell/plugins/voxtypeOverlay/` ya es **symlink** al repo,
+  por lo que los cambios QML se recargan sin copia manual.
 - `chat_completion_stream` no implementado (bloquea streaming).
 - `kb_index.py` = embeddings locales (sentence-transformers+torch) — candidato a
   ser REEMPLAZADO por OpenNotebook cuando la integración esté lista.
@@ -89,14 +90,16 @@ propio (vault Obsidian / OpenNotebook) + local + gratis + extensible.**
 ## 5. Fases del roadmap (ordenadas por prioridad del usuario)
 
 ### Sprint 0 — Estabilización (prerequisito, corto)
-- [ ] `git push` del commit pendiente (`fd0c02d`).
-- [ ] Confirmar symlink del plugin instalado; si es copia, migrar.
-- [ ] Fix **B01** (primera frase perdida): pre-arrancar `LiveCapture` en idle al
-      abrir el panel del auditor, o esperar a que los `pw-record` estén activos.
-- [ ] Fix **B02** (alucinación "Gracias."): subir `vad_threshold` (~0.010-0.015),
-      exigir mínimo de energía sostenida + frase ~500ms, y/o arrancar
-      `whisper-server` con `-sns` y `-nth 0.8`; opcional filtro post-transcripción
-      contra lista de alucinaciones conocidas.
+- [x] Commit local pequeño de Fase 0, sin push salvo solicitud explícita.
+- [x] Symlink del plugin instalado confirmado.
+- [ ] Validar en vivo el fix de **B01** (primera frase perdida): arranque
+      optimista al pulsar iniciar, auditor antes del respaldo de `voxtype
+      meeting`, y captura en paralelo con la carga de `whisper-server`.
+- [ ] Dejar **B02** como calibración adaptativa futura. El umbral agresivo
+      (`vad_threshold ≈ 0.010-0.015`, frase mínima ~500 ms,
+      `--suppress-nst`/`--no-speech-thold`) ya se probó en vivo, eliminó voz
+      real de baja energía y se revirtió. No reintroducirlo sin una prueba de
+      silencio y otra de voz baja.
 
 ### Sprint 1 — Prioridad ALTA ("lo primero", habilita UX y benchmarking)
 - [ ] **Modo debug** (toggle, default OFF): métricas por etapa

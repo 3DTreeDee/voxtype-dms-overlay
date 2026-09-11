@@ -236,14 +236,22 @@ PluginComponent {
     }
     function meetingDispatch(act) {
         switch (act) {
-        case "start":   root.meetingStarting = true; meetingStartTimeout.restart(); meetingCmd(["start"]); break;
-        case "startml": root.meetingStarting = true; meetingStartTimeout.restart(); meetingCmd(["start", "--diarization", "ml"]); break;
+        case "start":   root.meetingStarting = true; meetingStartTimeout.restart(); root.meetingAuditorStarting(); meetingCmd(["start"]); break;
+        case "startml": root.meetingStarting = true; meetingStartTimeout.restart(); root.meetingAuditorStarting(); meetingCmd(["start", "--diarization", "ml"]); break;
         case "pause":   meetingCmd(["pause"]); break;
         case "resume":  meetingCmd(["resume"]); break;
         case "stop":    root.meetingStarting = false; meetingStartTimeout.stop(); meetingCmd(["stop"]); break;
         case "folder":  Quickshell.execDetached(["sh", "-c", "xdg-open \"$HOME/.local/share/voxtype/meetings\""]); break;
         }
         closePopout();
+    }
+
+    // Avisar al daemon en cuanto se pulsa iniciar: el auditor arranca en
+    // paralelo con `voxtype meeting start`, sin esperar al poll de estado.
+    // Si la reunión no llega a activarse, el timeout lo vuelve a apagar.
+    function meetingAuditorStarting() {
+        if (typeof pluginService !== "undefined" && pluginService)
+            pluginService.savePluginData(pluginId, "auditorMeetingActive", true);
     }
     function meetingStatusLabel() {
         if (root.meetingStarting)
@@ -283,7 +291,13 @@ PluginComponent {
         id: meetingStartTimeout
         interval: 15000
         repeat: false
-        onTriggered: root.meetingStarting = false
+        onTriggered: {
+            root.meetingStarting = false;
+            // Si la reunión jamás se activó, apagar también al auditor que se
+            // pre-arrancó de forma optimista al pulsar iniciar.
+            if (!root.meetingActive && typeof pluginService !== "undefined" && pluginService)
+                pluginService.savePluginData(pluginId, "auditorMeetingActive", false);
+        }
     }
 
     function refreshAll() {

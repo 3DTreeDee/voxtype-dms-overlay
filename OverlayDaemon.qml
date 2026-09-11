@@ -365,32 +365,28 @@ PluginComponent {
         // vivo usan el whisper-server propio del auditor (large-v3-turbo), así
         // que el modelo de dictado de voxtype se queda intacto (`small`).
 
-        // 1) Arrancar voxtype meeting (grabación COMPLETA de respaldo → transcript.json
+        // 1) Arrancar primero el auditor en modo capture (Fase 6): la captura
+        // continua y whisper-server arrancan en paralelo con la grabación de
+        // respaldo, reduciendo la primera frase perdida.
+        auditorThread.stop();
+        let args = [root.auditorScript()];
+        if (root.auditorVault !== "")
+            args = args.concat(["--vault", root.auditorVault]);
+        // OJO: --mic-source/--loop-source pertenecen al SUBPARSER
+        // `capture` (argparse) → SIEMPRE después de "capture"; antes
+        // provoca "unrecognized arguments" y el proceso muere (exit 2).
+        args = args.concat(["capture"]);
+        if (root.auditorMicSource !== "")
+            args = args.concat(["--mic-source", root.auditorMicSource]);
+        if (root.auditorLoopSource !== "")
+            args = args.concat(["--loop-source", root.auditorLoopSource]);
+        auditorThread.commandModel = args;
+        auditorThread.start();
+
+        // 2) Arrancar voxtype meeting (grabación COMPLETA de respaldo → transcript.json
         //    al hacer stop; es la que se exporta/indexa para RAG)
         Proc.runCommand("voxtypeOverlay.startMeeting", ["voxtype", "meeting", "start"],
             (stdout, exitCode) => {}, 0, 10000);
-
-        // 2) Esperar ~2s, luego lanzar el auditor en modo capture (Fase 6):
-        //    captions por fin-de-frase vía whisper-server HTTP persistente
-        //    (el propio auditor arranca whisper-server si no está corriendo).
-        Qt.callLater(() => {
-            Qt.callLater(() => {
-                auditorThread.stop();
-                let args = [root.auditorScript()];
-                if (root.auditorVault !== "")
-                    args = args.concat(["--vault", root.auditorVault]);
-                // OJO: --mic-source/--loop-source pertenecen al SUBPARSER
-                // `capture` (argparse) → SIEMPRE después de "capture"; antes
-                // provoca "unrecognized arguments" y el proceso muere (exit 2).
-                args = args.concat(["capture"]);
-                if (root.auditorMicSource !== "")
-                    args = args.concat(["--mic-source", root.auditorMicSource]);
-                if (root.auditorLoopSource !== "")
-                    args = args.concat(["--loop-source", root.auditorLoopSource]);
-                auditorThread.commandModel = args;
-                auditorThread.start();
-            });
-        });
     }
 
     function stopAuditor() {
