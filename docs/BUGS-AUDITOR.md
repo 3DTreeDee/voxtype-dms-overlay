@@ -1,6 +1,6 @@
 # Bugs y deuda técnica — Auditor de reuniones
 
-> Actualizado: 2026-09-11 (sesión OpenCode, Fase 0)
+> Actualizado: 2026-09-11 (sesión OpenCode, Sprint 1)
 > Rama: `feat/auditor-meetings`
 > Base: `docs/AUDITOR-PLAN.md` (fases 1-7) y `docs/HANDOFF-OPENGODE.md`
 > Objetivo de este doc: lista viva de bugs abiertos + evidencia, para retomar
@@ -15,11 +15,12 @@
 | B03 | Alta  | Anti-sidetone 7.9 (voz propia como "Remoto") | Fix aplicado, validar |
 | B04 | Media | Frase corrupta al cierre (IME/teclado virtual) | Abierto |
 | B05 | Media | Feed arrastra texto viejo / aparece en dictado | Mitigado, validar |
-| B06 | Media | Latencia push-to-ask ~4-6 s (dominada por la IA) | Mejora |
+| B06 | Media | Latencia push-to-ask ~4-6 s (dominada por la IA) | Streaming implementado, validar en vivo |
 | B07 | Baja  | Scroll invertido en la vista previa de Settings | Abierto |
 | B08 | Baja  | `voxtype-export-mtg` vive fuera del repo | Abierto |
 | B09 | Alta  | Ventana del auditor aparece/desaparece al iniciar reunión | **Resuelto** |
 | B10 | Alta  | Contaminación de `config.toml` de voxtype (modelo `large`) | **Resuelto** |
+| B11 | Media | Micro-saltos del feed mientras crece el stream | Abierto (documentado para próxima sesión) |
 
 ## 2. Detalle
 
@@ -81,11 +82,16 @@
   reconcilia `meetingRunning` contra `voxtype meeting status` al cargar.
 - **Pendiente**: validar en vivo.
 
-### B06 — Latencia push-to-ask ~4-6 s · Media · Mejora
-- **Desglose** (`auditor.py:572`): cierre VAD ~0.8 s + whisper ~0.5 s + sleep
-  0.5 s + IA `auto/best-chat` ~3.5 s. Dominada por la llamada a la IA.
-- **Mejora**: implementar `chat_completion_stream` (`omniroute_client.py:167`
-  es `NotImplementedError`) y renderizar tokens progresivos.
+### B06 — Latencia push-to-ask ~4-6 s · Media · Streaming implementado, validar en vivo
+- **Desglose previo**: cierre VAD ~0.8 s + whisper ~0.5 s + sleep 0.5 s + IA
+  `auto/best-chat` ~3.5 s. Dominada por la llamada a la IA.
+- **Fix aplicado**: `chat_completion_stream` SSE robusto, eventos
+  `ai_stream_start/delta/done/error` correlacionados por `request_id`,
+  render progresivo solo en “Sugerir”, fallback sincrónico sin tokens y error
+  parcial marcado como incompleto si el stream se interrumpe.
+- **Pendiente**: medir primer token en reunión real y confirmar latencia
+  percibida ≤~2 s. Los micro-saltos residuales del render se siguen en B11; el
+  retardo del primer token es del proveedor, no del render.
 
 ### B07 — Scroll invertido en Settings · Baja · Abierto
 - Solo en la vista previa de `Settings.qml`; el feed real ya funciona.
@@ -111,6 +117,37 @@
   dictado normal.
 - **Fix**: script corregido y round-trip verificado; `config.toml` restaurado a
   `small` (igual que el `.bak` original). Swap desactivado por defecto.
+
+### B11 — Micro-saltos del feed durante el stream · Media · Abierto (documentado para próxima sesión)
+- **Síntoma**: con auto-scroll ON, la respuesta progresiva aparece pero la vista
+  hace pequeños saltos mientras el texto crece.
+- **Evidencia** (sesión `session_20260911-062845_1390506.jsonl`, proveedor
+  `auto/best-chat`):
+  | request | primer token | deltas | total |
+  |---|---:|---:|---:|
+  | `mtwvifem-fv66` | 10 745.1 ms | 1 / 97 caracteres | 12 259.3 ms |
+  | `mtwvj979-7moy` | 19 546.3 ms | 42 / 363 caracteres | 23 091.5 ms |
+  | `mtwvk5n9-q9x0` | 18 159.6 ms | 99 / 830 caracteres | 23 757.0 ms |
+- **Mitigaciones ya aplicadas**:
+  - Lotes en Python: primer delta inmediato, luego cada 75 ms o 64 caracteres.
+  - QML conserva un solo placeholder por `request_id`; los deltas actualizan
+    `streamTexts` + `streamRevision` sin reconstruir todo el modelo.
+  - Auto-scroll con una sola llamada diferida y animación de 120 ms solo cuando
+    auto-scroll está ON.
+- **Hipótesis abiertas**:
+  1. `contentHeight` cambia por reflow mientras la animación y las llamadas a
+     `positionViewAtEnd` compiten entre lotes.
+  2. Otros captions/debug intercalados o el recorte `maxEvents` mueven el
+     modelo durante el stream.
+  3. Re-medición del delegate por wrap, emoji, fuentes o altura del cursor.
+- **Próxima sesión**:
+  1. Instrumentar `contentY`, `contentHeight`, `count` y timestamps durante un
+     stream con debug.
+  2. Comparar auto-scroll ON/OFF y respuestas cortas/largas.
+  3. Evaluar anclaje de cola con actualización coalescida por frame o un modelo
+     dedicado a la fila activa.
+  4. No cambiar de modelo/proveedor en ese paso: el retardo del primer token es
+     un problema separado del render.
 
 ## 3. Tema abierto: ¿transcripción en streaming?
 

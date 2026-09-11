@@ -142,6 +142,8 @@ class AudioChunk:
     loop_wav: Optional[Path] = None
     mic_rms: float = 0.0
     loop_rms: float = 0.0
+    closed_at_ms: float = 0.0
+    secs: float = 0.0
 
 
 def _wav_data_offset(path: Path) -> int:
@@ -509,6 +511,8 @@ class LiveCapture:
             return  # menos de 250ms de voz: no es frase
 
         peak = max((r for r, _ in wins[:end]), default=0.0)
+        now_ms = time.time() * 1000.0
+        phrase_secs = len(frames) / (SAMPLE_RATE * _SAMPWIDTH * _CHANNELS)
 
         # Rediseño 7.9 — prioridad temporal del mic: si el mic (fuente
         # autoritativa de la voz del usuario) tuvo voz hace <2s, lo que cierra
@@ -541,9 +545,13 @@ class LiveCapture:
         except Exception:
             return
         if tag == "mic":
-            self._chunks.put_nowait(AudioChunk(mic_wav=out, mic_rms=peak))
+            self._chunks.put_nowait(AudioChunk(mic_wav=out, mic_rms=peak,
+                                               closed_at_ms=now_ms,
+                                               secs=phrase_secs))
         else:
-            self._chunks.put_nowait(AudioChunk(loop_wav=out, loop_rms=peak))
+            self._chunks.put_nowait(AudioChunk(loop_wav=out, loop_rms=peak,
+                                               closed_at_ms=now_ms,
+                                               secs=phrase_secs))
 
     @property
     def mic_source_name(self) -> str:

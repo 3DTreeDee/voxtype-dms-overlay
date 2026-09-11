@@ -349,6 +349,50 @@ PluginComponent {
     AuditorThread {
         id: auditorThread
         autoStart: false
+        debugMode: root.auditorDebug
+    }
+
+    // Estado compartido de Sugerir: un clic en cualquier pantalla marca el ID
+    // activo y todas las superficies muestran la misma animación/ocupado.
+    property string activeSuggestId: ""
+    property bool suggestBusy: false
+
+    function beginSuggest(requestId) {
+        root.activeSuggestId = requestId;
+        root.suggestBusy = true;
+        suggestTimeout.restart();
+    }
+
+    function clearSuggest(requestId) {
+        if (requestId && requestId !== root.activeSuggestId)
+            return;
+        root.activeSuggestId = "";
+        root.suggestBusy = false;
+        suggestTimeout.stop();
+    }
+
+    function clearSuggestIfDone(evt) {
+        if (!root.suggestBusy || !evt || evt.request_id !== root.activeSuggestId)
+            return;
+        if (evt.type === "ai_answer" || evt.type === "kb_hit" || evt.type === "ai_error"
+                || evt.type === "ai_stream_done" || evt.type === "ai_stream_error")
+            root.clearSuggest(evt.request_id);
+        else if (evt.type === "info" && evt.msg === "Aún no hay transcripción para sugerir.")
+            root.clearSuggest(evt.request_id);
+    }
+
+    Connections {
+        target: auditorThread
+        function onEventReceived(evt) {
+            root.clearSuggestIfDone(evt);
+        }
+    }
+
+    Timer {
+        id: suggestTimeout
+        interval: 65000
+        repeat: false
+        onTriggered: root.clearSuggest("")
     }
 
     // El feed del auditor se integra dentro de OverlayWindow (PanelWindow ya
@@ -376,6 +420,8 @@ PluginComponent {
         // `capture` (argparse) → SIEMPRE después de "capture"; antes
         // provoca "unrecognized arguments" y el proceso muere (exit 2).
         args = args.concat(["capture"]);
+        if (root.auditorDebug)
+            args = args.concat(["--debug"]);
         if (root.auditorMicSource !== "")
             args = args.concat(["--mic-source", root.auditorMicSource]);
         if (root.auditorLoopSource !== "")
@@ -390,6 +436,7 @@ PluginComponent {
     }
 
     function stopAuditor() {
+        root.clearSuggest("");
         auditorThread.stop();
 
         // Detener voxtype meeting
@@ -405,6 +452,10 @@ PluginComponent {
     // Auto-scroll del feed del auditor: ON = el feed queda pegado abajo con
     // cada frase nueva; OFF = scroll libre (no salta). Persistido en pluginData.
     readonly property bool auditorAutoScroll: (pluginData && pluginData.auditorAutoScroll !== undefined) ? pluginData.auditorAutoScroll : true
+
+    // Modo debug del auditor: muestra métricas por etapa en el feed y guarda
+    // JSONL/CSV de la sesión. El proceso auditor lo lee al arrancar.
+    readonly property bool auditorDebug: (pluginData && pluginData.auditorDebug !== undefined) ? pluginData.auditorDebug : false
 
     function setAuditorAutoScroll(v) {
         if (typeof pluginService !== "undefined" && pluginService)

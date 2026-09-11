@@ -321,6 +321,14 @@ PluginSettings {
         placeholder: "sk-..."
     }
 
+    // ── Modo debug del auditor (Sprint 1) ─────────────────────────────────
+    ToggleSetting {
+        settingKey: "auditorDebug"
+        label: "Modo debug del auditor"
+        description: "Cuando está ON, el feed muestra latencias por etapa (VAD, Whisper, IA), modelo, tokens y un resumen de la respuesta cruda. También guarda métricas JSONL/CSV por sesión en ~/.local/share/voxtype-auditor/metrics. Se aplica al iniciar la próxima reunión."
+        defaultValue: false
+    }
+
     // ── Probar conexión + estado (Fase 1) ──────────────────────────────────
     Item {
         width: parent.width

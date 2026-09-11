@@ -37,6 +37,17 @@ PanelWindow {
     // OFF = scroll libre, sin saltos. Persistido en pluginData (daemon).
     readonly property bool autoScrollFeed: (daemon && daemon.auditorAutoScroll !== undefined) ? daemon.auditorAutoScroll : true
 
+    // Modo debug: refleja el toggle del daemon y controla la visibilidad de
+    // las líneas de métricas. El backend solo emite eventos debug si el modo
+    // estaba ON al iniciar la reunión.
+    readonly property bool debugMode: (daemon && daemon.auditorDebug !== undefined) ? daemon.auditorDebug : false
+
+    // Estado compartido de Sugerir: lo gestiona el daemon para que todas las
+    // pantallas muestren la misma animación hasta que llegue la respuesta o
+    // el error correspondiente a la solicitud activa.
+    readonly property bool suggestBusy: daemon ? daemon.suggestBusy : false
+    property int suggestDots: 0
+
     // Cada reunión nueva: re-aplicar geometría guardada (el Item solo se crea
     // una vez al cargar el plugin) y resetear colapso/oculto.
     onAuditorModeChanged: {
@@ -509,7 +520,7 @@ PanelWindow {
                 anchors.topMargin: 8
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.bottom: askBtn.top
+                anchors.bottom: suggestBtn.top
                 anchors.bottomMargin: 6
                 color: "transparent"
                 clip: true
@@ -523,6 +534,16 @@ PanelWindow {
                     clip: true
                     boundsBehavior: Flickable.StopAtBounds
 
+                    // Seguir el final con una animación corta cuando el modo
+                    // auto-scroll está activo; no interfiere con el scroll libre.
+                    Behavior on contentY {
+                        enabled: win.autoScrollFeed
+                        NumberAnimation {
+                            duration: 120
+                            easing.type: Easing.OutQuad
+                        }
+                    }
+
                     // Auto-scroll condicionado por el switch del panel:
                     //  - ON  → pegado abajo (siempre lo más reciente).
                     //  - OFF → scroll libre, no se mueve al llegar texto.
@@ -530,15 +551,12 @@ PanelWindow {
                     // (b) onContentHeightChanged: el layout creció/ajustó (la
                     //     altura del delegate no está medida al llegar el evento;
                     //     sin esto el scroll quedaba a medias y luego "saltaba").
-                    // Doble callLater para posicionar tras medir el delegate.
+                    // Llamada diferida para posicionar tras medir el delegate.
                     function scrollToBottom() {
                         if (win.autoScrollFeed && qlist.count > 0)
                             qlist.positionViewAtEnd();
                     }
-                    onCountChanged: Qt.callLater(() => {
-                        scrollToBottom();
-                        Qt.callLater(scrollToBottom);
-                    })
+                    onCountChanged: Qt.callLater(scrollToBottom)
                     onContentHeightChanged: Qt.callLater(scrollToBottom)
                     Component.onCompleted: Qt.callLater(scrollToBottom)
 
@@ -547,6 +565,8 @@ PanelWindow {
                         width: ListView.view.width
                         height: e.type === "info"
                             ? (infoLine.implicitHeight + 8)
+                            : e.type === "debug"
+                            ? (debugLine.implicitHeight + 8)
                             : Math.max(rowC.implicitHeight + 12, 40)
 
                         // Info relevante (estado ask/IA/errores): línea sutil y
@@ -567,9 +587,27 @@ PanelWindow {
                             wrapMode: Text.WordWrap
                         }
 
+                        // Métricas de debug: línea técnica con latencia, modelo,
+                        // tokens y respuesta cruda recortada. Solo llega al feed
+                        // cuando el modo debug estaba ON al iniciar la reunión.
+                        StyledText {
+                            id: debugLine
+                            visible: e.type === "debug"
+                            anchors.top: parent.top
+                            anchors.topMargin: 4
+                            anchors.left: parent.left
+                            anchors.leftMargin: 6
+                            anchors.right: parent.right
+                            anchors.rightMargin: 6
+                            text: "🐞 " + (e.line || "") + (e.detail ? "\n" + e.detail : "")
+                            font.pixelSize: 12
+                            color: Qt.rgba(0.65, 0.85, 1, 0.9)
+                            wrapMode: Text.WordWrap
+                        }
+
                         Column {
                             id: rowC
-                            visible: e.type !== "info"
+                            visible: e.type !== "info" && e.type !== "debug"
                             anchors.left: parent.left
                             anchors.leftMargin: 2
                             anchors.right: parent.right
@@ -592,10 +630,10 @@ PanelWindow {
                                     spacing: 3
                                     StyledText {
                                         width: parent.width
-                                        text: (e.type === "kb_hit" || e.type === "ai_answer") ? "Auditor" : (e.speaker === "you") ? "Tú" : "Remoto"
+                                        text: (e.type === "kb_hit" || e.type === "ai_answer" || e.type === "ai_streaming") ? "Auditor" : (e.speaker === "you") ? "Tú" : "Remoto"
                                         font.pixelSize: 12
                                         font.bold: true
-                                        color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : (e.type === "ai_answer") ? Qt.rgba(0.45, 0.7, 1, 1) : Theme.surfaceVariantText
+                                        color: (e.type === "kb_hit" || (e.type === "ai_streaming" && e.kind === "kb_hit")) ? Qt.rgba(0.35, 0.8, 0.5, 1) : (e.type === "ai_answer" || e.type === "ai_streaming") ? Qt.rgba(0.45, 0.7, 1, 1) : Theme.surfaceVariantText
                                     }
                                     StyledText {
                                         id: txt
@@ -610,16 +648,20 @@ PanelWindow {
 
                             StyledText {
                                 width: parent.width
-                                visible: e.type === "kb_hit" || e.type === "ai_answer"
-                                text: (e.type === "kb_hit" ? "📚 " : "💡 ") + (e.answer || "")
+                                visible: e.type === "kb_hit" || e.type === "ai_answer" || e.type === "ai_streaming"
+                                text: ((e.type === "kb_hit" || (e.type === "ai_streaming" && e.kind === "kb_hit")) ? "📚 " : "💡 ")
+                                    + (e.type === "ai_streaming" && win.auditor
+                                        ? win.auditor.streamText(e.request_id)
+                                        : (e.answer || ""))
+                                    + ((e.type === "ai_streaming" && e.streaming !== false) ? " ▍" : "")
                                 font.pixelSize: 14
-                                color: (e.type === "kb_hit") ? Qt.rgba(0.35, 0.8, 0.5, 1) : Qt.rgba(0.45, 0.7, 1, 1)
+                                color: (e.type === "kb_hit" || (e.type === "ai_streaming" && e.kind === "kb_hit")) ? Qt.rgba(0.35, 0.8, 0.5, 1) : Qt.rgba(0.45, 0.7, 1, 1)
                                 wrapMode: Text.WordWrap
                             }
                             StyledText {
                                 width: parent.width
                                 visible: e.type === "ai_error"
-                                text: "⚠️ " + (e.error || "")
+                                text: "⚠️ " + (e.error || "") + (e.partial ? "\nParcial: " + e.partial + (e.incomplete ? " [incompleta]" : "") : "")
                                 font.pixelSize: 12
                                 color: Theme.errorText
                                 wrapMode: Text.WordWrap
@@ -640,46 +682,72 @@ PanelWindow {
                 }
             }
 
-            // ── Botón Preguntar (Fase 4 — push-to-ask) ──────────────────────
+            // ── Botón Sugerir (Sprint 1 — un clic) ───────────────────────────
             Rectangle {
-                id: askBtn
+                id: suggestBtn
                 anchors.bottom: parent.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
                 height: 36
                 radius: 8
-                color: askMouse.pressed ? Qt.rgba(0.7, 0.3, 1, 0.5)
-                     : askMouse.containsMouse ? Qt.rgba(0.6, 0.25, 0.9, 0.35)
+                color: suggestMouse.containsMouse ? Qt.rgba(0.6, 0.25, 0.9, 0.35)
                      : Qt.rgba(0.5, 0.2, 0.8, 0.2)
                 border.width: 1
-                border.color: Qt.rgba(0.7, 0.4, 1, 0.4)
+                border.color: win.suggestBusy ? Qt.rgba(0.85, 0.55, 1, 0.9)
+                     : Qt.rgba(0.7, 0.4, 1, 0.4)
+
+                Rectangle {
+                    anchors.fill: parent
+                    radius: 8
+                    visible: win.suggestBusy
+                    color: Qt.rgba(0.72, 0.38, 1, 0.35)
+                    SequentialAnimation on opacity {
+                        running: win.suggestBusy
+                        loops: Animation.Infinite
+                        PropertyAnimation { from: 0.2; to: 0.55; duration: 550 }
+                        PropertyAnimation { from: 0.55; to: 0.2; duration: 550 }
+                    }
+                }
 
                 StyledText {
                     anchors.centerIn: parent
-                    text: askMouse.pressed ? "🎤 Preguntando… suelta para consultar" : "🔍 Preguntar (o ScrollLock)"
+                    text: win.suggestBusy
+                        ? "💡 Sugiriendo" + "...".substring(0, win.suggestDots)
+                        : "💡 Sugerir"
                     font.pixelSize: 13
                     font.bold: true
-                    color: askMouse.pressed ? Qt.rgba(1, 1, 1, 0.9) : Qt.rgba(0.8, 0.6, 1, 0.9)
+                    color: Qt.rgba(0.8, 0.6, 1, 0.9)
+                }
+
+                Timer {
+                    id: suggestDotTimer
+                    interval: 350
+                    repeat: true
+                    running: win.suggestBusy
+                    onTriggered: win.suggestDots = (win.suggestDots + 1) % 4
                 }
 
                 MouseArea {
-                    id: askMouse
+                    id: suggestMouse
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    // Push-to-ask con marcadores SEPARADOS (ask_start / ask_end):
-                    // antes se usaba UN sólo ask.cmd sobreescrito con `echo -n >
-                    // ask.cmd`, y la carrera start/end hacía que el watcher
-                    // perdiera comandos → preguntas sin respuesta. Cada marcador
-                    // es un archivo distinto (touch), sin truncado ni solape.
-                    onPressed: {
-                        Proc.runCommand("voxtypeOverlay.askStart",
-                            ["sh", "-c", "mkdir -p /tmp/voxtype-auditor && touch /tmp/voxtype-auditor/ask_start"],
-                            () => {});
-                    }
-                    onReleased: {
-                        Proc.runCommand("voxtypeOverlay.askEnd",
-                            ["sh", "-c", "touch /tmp/voxtype-auditor/ask_end"],
+                    // Un clic crea una solicitud explícita y atómica. El
+                    // backend la consume una vez y responde con la
+                    // transcripción reciente + contexto; ya no hay que
+                    // mantener nada presionado.
+                    onClicked: {
+                        const requestId = Date.now().toString(36) + "-" + Math.floor(Math.random() * 1679616).toString(36);
+                        const issuedAt = Date.now();
+                        win.suggestDots = 0;
+                        const targetDir = "/tmp/voxtype-auditor";
+                        const tmpPath = targetDir + "/.ask_request_" + requestId + ".tmp";
+                        const finalPath = targetDir + "/ask_request_" + requestId + ".json";
+                        const payload = "{\"id\":\"" + requestId + "\",\"ts\":" + issuedAt + ",\"context_phrases\":10}";
+                        if (win.daemon && win.daemon.beginSuggest)
+                            win.daemon.beginSuggest(requestId);
+                        Proc.runCommand("voxtypeOverlay.suggest",
+                            ["sh", "-c", "mkdir -p \"" + targetDir + "\" && printf '%s' '" + payload + "' > \"" + tmpPath + "\" && mv \"" + tmpPath + "\" \"" + finalPath + "\""],
                             () => {});
                     }
                 }

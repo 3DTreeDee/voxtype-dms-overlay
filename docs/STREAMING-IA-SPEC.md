@@ -3,7 +3,24 @@
 > **Objetivo**: reducir la latencia percibida de respuesta IA de ~4-6s a ≤~2s
 > mediante streaming SSE + renderizado progresivo de tokens en el feed.
 > **Archivo de referencia**: `docs/ROADMAP-FEATURES.md` — Sprint 1.
-> **Estado**: 2026-09-11. Todo lo que se describe aquí no existe en el código actual.
+> **Estado de implementación (2026-09-11)**: implementado y pendiente de prueba
+> en vivo. Las secciones siguientes conservan el diseño inicial; donde difieran,
+> la implementación vigente es:
+>
+> - `chat_completion(stream=True)` sigue rechazado; el streaming usa el
+>   generador explícito `chat_completion_stream`.
+> - Los eventos usan `request_id` de la solicitud explícita, no un `stream_id`
+>   separado.
+> - Los deltas se agrupan en Python (primero inmediato, luego cada 75 ms o 64
+>   caracteres).
+> - QML conserva texto parcial por `request_id` y una revisión de repintado, en
+>   lugar de reemplazar todo el arreglo por token o de usar índices fijos.
+> - `ai_stream_done`/`ai_stream_error` se convierten en la única entrada final;
+>   el fallback sin tokens emite `ai_stream_done` y no duplica la respuesta.
+> - La respuesta parcial interrumpida se guarda como `ai_error` con `partial` e
+>   `incomplete`, sin crear además una respuesta completa distinta.
+> - El timeout de seguridad de “Sugerir” es 65 s para cubrir el timeout total
+>   del stream.
 
 ---
 
@@ -27,28 +44,22 @@ respuesta completa de golpe. El interlocutor remoto percibe silencio.
 
 ## 1. Cambios en `audit/omniroute_client.py`
 
-### 1.1 — `chat_completion` (línea 147): redirigir `stream=True`
+### 1.1 — `chat_completion` (línea 147): no redirigir `stream=True`
 
-```python
-# Línea 166-167: REEMPLAZAR
-if stream:
-    raise NotImplementedError("Streaming no implementado aún; usar sync")
+> Implementación vigente: `chat_completion(stream=True)` sigue lanzando
+> `NotImplementedError`. La ruta de streaming llama directamente al generador
+> explícito `chat_completion_stream`.
 
-# POR:
-if stream:
-    return self.chat_completion_stream(messages, task=task,
-        temperature=temperature, max_tokens=max_tokens)
-```
 
-Esto permite que `auditor.py` llame a `chat_completion(stream=True)` sin
-romper el contrato actual. Los callers existentes pasan `stream=False`
-por defecto → no se rompe nada.
+No se aplica el reemplazo anterior. La implementación vigente conserva el
+contrato sincrónico y usa directamente `chat_completion_stream(..., stats=...)`.
 
-### 1.2 — `chat_completion_stream` (línea 175): añadir robustez
+### 1.2 — `chat_completion_stream`: implementación vigente
 
-El método actual (líneas 175-204) funciona pero sin manejo de errores.
-
-**Cambios necesarios:**
+El generador ya maneja SSE robusto, `stream_options.include_usage` con
+fallback, reintentos previos al primer token, timeouts de primer token,
+inactividad y total, y telemetría en `stats`. El fragmento siguiente era el
+diseño inicial y no debe aplicarse tal cual.
 ```python
 async def chat_completion_stream(self, messages, task="kb_fallback",
                                   temperature=None, max_tokens=None):
@@ -119,7 +130,17 @@ Agregar al bloque de emit del helper (cerca de línea 35):
 # {"type":"info",...}
 ```
 
-### 2.2 — Nuevo método `_ai_answer_stream` en `MeetingAuditor`
+> Implementación vigente: los eventos usan `request_id` de la solicitud
+> explícita y deltas por lotes (`ai_stream_delta`), no un `stream_id`
+> separado ni un delta por token. El único registro persistente es el evento
+> final convertido; los parciales no se guardan en la sesión.
+
+### 2.2 — Método `_ai_answer_stream` en `MeetingAuditor` (implementación vigente)
+
+El método comparte el constructor de prompts con `_ai_answer`, emite lotes y
+usa `request_id`.
+
+Diseño inicial conservado abajo como referencia:
 
 Agregar después de `_ai_answer` (línea 208):
 
@@ -173,7 +194,14 @@ async def _ai_answer_stream(self, side: str, text: str,
     return full_answer
 ```
 
-### 2.3 — Cambiar `_end_ask_rag` para usar streaming
+### 2.3 — `_answer_suggest_question` usa streaming (implementación vigente)
+
+`_end_ask_rag` ya no existe. La solicitud explícita llama a
+`_answer_suggest_question`, que invoca `_ai_answer_stream` y conserva una sola
+entrada final en `session_log`. No se emite una terminal duplicada junto a
+`ai_stream_done`.
+
+Diseño inicial conservado abajo como referencia:
 
 En `_end_ask_rag` (línea 572), reemplazar la llamada a `_ai_answer`:
 
@@ -197,7 +225,11 @@ aplicar el mismo patrón. Para Sprint 1 solo `_end_ask_rag` usa streaming.
 
 ---
 
-## 3. Cambios en `auditor_components/AuditorThread.qml`
+## 3. Implementación vigente en `auditor_components/AuditorThread.qml`
+
+Los fragmentos siguientes eran el diseño inicial. La implementación conserva
+`ai_streaming`, pero usa `request_id`, un mapa de texto parcial y una revisión
+de repintado; no usa índices fijos ni reemplaza todo el arreglo por token.
 
 ### 3.1 — Manejar evento `ai_stream` en `_handleLine`
 
@@ -327,40 +359,46 @@ StyledText {
 }
 ```
 
-### 4.3 — Auto-scroll al final durante streaming
+### 4.3 — Auto-scroll durante streaming (implementación vigente)
+
+El crecimiento del texto parcial cambia la altura del delegate y conserva el
+comportamiento del switch existente: con auto-scroll ON baja al final; con OFF
+no mueve la vista.
+
+Diseño inicial conservado abajo como referencia:
 
 Ya existe `onCountChanged: Qt.callLater(scrollToBottom)` (línea 539-541).
 Con el streaming, `root.events` se actualiza por cada delta → el
 `onCountChanged` se dispara una vez (al crear el placeholder) y luego
 `onDataChanged` del array dispara re-render. Agregar:
 
-```javascript
-// En el ListView, después de onCountChanged:
-onDataChanged: Qt.callLater(scrollToBottom)
-```
+> Implementación vigente: no se usa `onDataChanged`, que no existe como señal
+> útil del `ListView` para este caso. El delegate se repinta mediante
+> `streamTexts` + `streamRevision`; `onContentHeightChanged` conserva el
+> auto-scroll cuando está activado.
 
 ---
 
-## 5. Flujo final (con streaming)
+## 5. Flujo final implementado
 
 ```
 Usuario presiona "Sugerir"
-  → auditor.py: _end_ask_rag()
-    → _ai_answer_stream("you", ask_text, results, emit)
-      → self.ai.chat_completion_stream(messages)   ← async generator
+  → auditor.py: _answer_suggest_question()
+    → _ai_answer_stream("you", ask_text, results, request_id, emit, telemetry)
+      → self.ai.chat_completion_stream(messages, stats=stats)   ← async generator
         → primer token en ~300-500ms
-          → emit({"type":"ai_stream","delta":"El","stream_id":"a1b2"})
-          → emit({"type":"ai_stream","delta":" resultado","stream_id":"a1b2"})
-          → emit({"type":"ai_stream","delta":" es...","stream_id":"a1b2"})
+          → emit({"type":"ai_stream_delta","delta":"El","request_id":"a1b2"})
+          → emit({"type":"ai_stream_delta","delta":" resultado","request_id":"a1b2"})
+          → emit({"type":"ai_stream_delta","delta":" es...","request_id":"a1b2"})
           ...
-          → emit({"type":"ai_stream_done","answer":"El resultado es...","stream_id":"a1b2"})
+          → emit({"type":"ai_stream_done","answer":"El resultado es...","request_id":"a1b2"})
   → AuditorThread._handleLine()
-    → _appendStreamDelta(evt)  ← crea placeholder, actualiza text
-    → _finalizeStream(evt)     ← convierte a ai_answer definitivo
+    → mapa de texto parcial por `request_id` + placeholder `ai_streaming`
+    → convierte `ai_stream_done` en la única entrada final
   → OverlayWindow delegate
-    → ve "El resultado es..." creciendo token a token
-    → cursor pulsante durante el streaming
-    →答案 completa al final con 💡
+    → ve "El resultado es..." creciendo por lotes
+    → cursor durante el streaming
+    → respuesta completa al final con 💡 o 📚
 ```
 
 **Latencia percibida**: primer token a ~500ms (vs ~3.5s actual).
@@ -388,5 +426,19 @@ Usuario presiona "Sugerir"
 | OmniRoute no soporta SSE | OmniRoute es OpenAI-compatible v1 → SSE es parte del estándar; si falla, fallback a sync con warning |
 | QML ListView no reacciona a cambios en array | Ya funciona para `ai_answer` existente; `_appendStreamDelta` reemplaza el array completo por evento |
 | Tokens parciales llegan cortados (mitad de palabra) | No importa: el renderizado es continuo, la palabra se completa con el siguiente chunk |
-| Timeout en streaming (responde lento) | `aiohttp.ClientTimeout(total=60)` ya cubierto; si timeout → `ai_error` + fallback a sync |
-| Usuario hace clic en "Sugerir" múltiples veces | El `stream_id` UUID diferencia sesiones; cada stream actualiza solo su placeholder |
+| Timeout en streaming (responde lento) | Timeouts explícitos de primer token (10 s), inactividad (15 s) y total (60 s); sin tokens usa fallback sincrónico; con texto parcial emite `ai_stream_error` y conserva el parcial marcado como incompleto |
+| Usuario hace clic en "Sugerir" múltiples veces | El `request_id` de la solicitud explícita diferencia sesiones; cada stream actualiza solo su placeholder |
+
+---
+
+## 8. Pendiente próxima sesión: micro-saltos del render
+
+Ver `docs/BUGS-AUDITOR.md` §B11. Ya no se reemplaza el modelo por cada delta:
+los deltas actualizan `streamTexts` + `streamRevision`, el placeholder se crea o
+finaliza una sola vez, y el auto-scroll usa una llamada diferida con animación
+de 120 ms solo cuando está activado.
+
+Queda por instrumentar `contentY`, `contentHeight`, `count` y timestamps durante
+un stream real, comparar auto-scroll ON/OFF y respuestas cortas/largas, y
+evaluar un anclaje de cola coalescido por frame o un modelo dedicado a la fila
+activa. No cambiar de modelo/proveedor en ese paso.

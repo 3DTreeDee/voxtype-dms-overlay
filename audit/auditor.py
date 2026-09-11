@@ -12,6 +12,7 @@ transcripción ya guardada.
 
 import os
 import sys
+import csv
 import json
 import time
 import argparse
@@ -19,7 +20,7 @@ import asyncio
 import logging
 import collections
 from pathlib import Path
-from typing import Dict, List, Optional, Iterator, Tuple
+from typing import Any, Dict, List, Optional, Iterator, Set, Tuple
 
 from kb_index import KBIndex
 from omniroute_client import OmniRouteClient, OmniRouteConfig, load_config_from_env_or_yaml
@@ -34,11 +35,31 @@ log = logging.getLogger("auditor")
 # {"type":"kb_hit",   "speaker":"you", "text":"...", "sources":[{"file_path","score"}], "answer":"..."}
 # {"type":"ai_answer","speaker":"you", "text":"...", "model":"...", "answer":"..."}
 # {"type":"ai_error", "speaker":"you", "text":"...", "error":"..."}
+# {"type":"debug", "metric":"startup|utterance|ai_answer|session", "line":"...", "detail":"...", "ts":epoch}
 # {"type":"info",     "msg":"..."}
 
 
 def emit(evt: Dict):
     print(json.dumps(evt, ensure_ascii=False), flush=True)
+
+
+class StreamInterruptedError(RuntimeError):
+    """Error de streaming con el texto parcial ya mostrado al usuario."""
+
+    def __init__(self, message: str, partial: str = ""):
+        super().__init__(message)
+        self.partial = partial
+
+
+# Contrato de "Sugerir" de un clic. Cada pulsación crea un archivo JSON único y
+# atómico; el backend lo consume una sola vez y responde con la transcripción
+# reciente más el contexto de la reunión.
+ASK_REQUEST_PREFIX = "ask_request_"
+ASK_REQUEST_SUFFIX = ".json"
+SUGGEST_CONTEXT_PHRASES = 10
+SUGGEST_MAX_CONTEXT_PHRASES = 12
+SUGGEST_SETTLE_SECS = 1.5
+SUGGEST_POLL_SECS = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +127,18 @@ class MeetingAuditor:
         raw_vs = self.config.get("vault_search", True)
         self.vault_search = bool(raw_vs)
         self.kb_threshold = float(self.config.get("kb_threshold", 0.70))
+        self.debug = bool(self.config.get("debug", False))
+        self.metrics_dir = Path.home() / ".local/share/voxtype-auditor/metrics"
+        self.metrics_session_id = ""
+        self.metrics_started_at_ms = 0
+        self.metrics_path = None
+        self.metrics_records: List[Dict] = []
         log.info(f"MeetingAuditor.__init__: vault_search={self.vault_search!r} (raw={raw_vs!r}) "
                  f"kb_threshold={self.kb_threshold} auto_reply={self.auto_reply}")
         # Bitácora de la sesión: se alimenta desde process_utterance y
-        # _end_ask_rag; al terminar capture_live se escribe como archivo JSON
-        # para exportar al vault con timestamps exactos de VAD.
+        # la respuesta explícita de Sugerir; al terminar capture_live se
+        # escribe como archivo JSON para exportar al vault con timestamps
+        # exactos de VAD.
         self.session_log: List[Dict] = []
         self._last_seen_text: Optional[str] = None  # para dedupe en modo realtime
         # Historial conversacional para el modo RAG con IA: los últimos
@@ -118,13 +146,17 @@ class MeetingAuditor:
         # (eso, cómo se conecta, el último proyecto...) al refinar la
         # búsqueda y al redactar la respuesta.
         self._conversation = collections.deque(maxlen=12)
+        self._utterance_seq = 0
+        self._processed_suggest_ids: Set[str] = set()
 
     # -- ¿IA configurada? (modo RAG vs. embeddings puros) --
     def _ai_configured(self) -> bool:
         return bool(self.ai) and bool(self.ai.config) and bool(self.ai.config.api_key)
 
-    def _remember(self, side: str, text: str) -> None:
-        self._conversation.append({"side": side, "text": text[:200]})
+    def _remember(self, side: str, text: str, ts: Optional[int] = None) -> None:
+        entry_ts = ts if isinstance(ts, int) else int(time.time() * 1000)
+        self._conversation.append({"side": side, "text": text[:200], "ts": entry_ts})
+        self._utterance_seq += 1
 
     def _conversation_block(self, max_items: int = 8) -> str:
         """Formatea el historial reciente como 'Tú: …' / 'Remoto: …'."""
@@ -133,6 +165,312 @@ class MeetingAuditor:
             who = "Tú" if item["side"] == "you" else "Remoto"
             lines.append(f"{who}: {item['text']}")
         return "\n".join(lines)
+
+    def _recent_question_text(self, context_phrases: int = SUGGEST_CONTEXT_PHRASES) -> str:
+        """Arma la pregunta explícita a partir de la transcripción reciente.
+
+        Respeta el orden, conserva el lado de cada frase y elimina duplicados
+        exactos para no inflar la consulta enviada a la IA.
+        """
+        try:
+            count = int(context_phrases)
+        except (TypeError, ValueError):
+            count = SUGGEST_CONTEXT_PHRASES
+        count = max(1, min(count, SUGGEST_MAX_CONTEXT_PHRASES))
+        parts = []
+        for item in list(self._conversation)[-count:]:
+            who = "Tú" if item.get("side") == "you" else "Remoto"
+            parts.append(f"{who}: {item.get('text', '')}")
+        seen = set()
+        uniq = []
+        for part in parts:
+            if part and part not in seen:
+                seen.add(part)
+                uniq.append(part)
+        return " | ".join(uniq)
+
+    def _consume_suggest_request(self, request_path: Path):
+        """Lee y consume una sola solicitud explícita de sugerencia.
+
+        Devuelve `(request_id, requested_at_ms, context_phrases)` o `None`
+        cuando el archivo es inválido, duplicado o ya fue consumido.
+        """
+        prefix_len = len(ASK_REQUEST_PREFIX)
+        suffix_len = len(ASK_REQUEST_SUFFIX)
+        name = request_path.name
+        if not name.startswith(ASK_REQUEST_PREFIX) or not name.endswith(ASK_REQUEST_SUFFIX):
+            return None
+        request_id = name[prefix_len:len(name) - suffix_len]
+        if not request_id or len(request_id) > 64:
+            request_path.unlink(missing_ok=True)
+            return None
+        if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in request_id):
+            request_path.unlink(missing_ok=True)
+            return None
+        try:
+            payload = json.loads(request_path.read_text(encoding="utf-8"))
+        except Exception:
+            request_path.unlink(missing_ok=True)
+            return None
+        if not isinstance(payload, dict) or payload.get("id") != request_id:
+            request_path.unlink(missing_ok=True)
+            return None
+        if request_id in self._processed_suggest_ids:
+            request_path.unlink(missing_ok=True)
+            return None
+        try:
+            requested_at = int(payload.get("ts", request_path.stat().st_mtime * 1000))
+        except (TypeError, ValueError, OSError):
+            requested_at = int(time.time() * 1000)
+        try:
+            context_phrases = int(payload.get("context_phrases", SUGGEST_CONTEXT_PHRASES))
+        except (TypeError, ValueError):
+            context_phrases = SUGGEST_CONTEXT_PHRASES
+        context_phrases = max(1, min(context_phrases, SUGGEST_MAX_CONTEXT_PHRASES))
+        request_path.unlink(missing_ok=True)
+        self._processed_suggest_ids.add(request_id)
+        if len(self._processed_suggest_ids) > 200:
+            self._processed_suggest_ids = set(list(self._processed_suggest_ids)[-200:])
+        return request_id, requested_at, context_phrases
+
+    async def _suggest_recent_question(self, request_id: str, context_phrases: int,
+                                       kb_top_k: int = 5, min_score: float = 0.20) -> None:
+        """Responde una solicitud explícita con transcripción reciente.
+
+        Espera brevemente una frase en vuelo, pero nunca depende de una
+        pulsación larga: si ya existe contexto transcrito, lo usa tal cual.
+        """
+        request_started = time.monotonic()
+        log.info(f"Sugerir ({request_id}): solicitud recibida")
+        emit({"type": "info", "msg": "💡 Sugiriendo…", "request_id": request_id})
+        base_seq = self._utterance_seq
+        deadline = request_started + SUGGEST_SETTLE_SECS
+        while time.monotonic() < deadline:
+            if self._utterance_seq > base_seq:
+                break
+            await asyncio.sleep(SUGGEST_POLL_SECS)
+        ask_text = self._recent_question_text(context_phrases)
+        if not ask_text:
+            log.info(f"Sugerir ({request_id}): sin transcripción disponible")
+            emit({"type": "info", "msg": "Aún no hay transcripción para sugerir.",
+                  "request_id": request_id})
+            return
+        await self._answer_suggest_question(request_id, ask_text, request_started,
+                                            kb_top_k, min_score)
+
+    async def _answer_suggest_question(self, request_id: str, ask_text: str,
+                                       request_started: float,
+                                       kb_top_k: int = 5,
+                                       min_score: float = 0.20) -> None:
+        """Corre RAG/IA para una pregunta explícita y emite la respuesta."""
+        log.info(f"Sugerir ({request_id}): {ask_text[:120]}")
+        evt_base = {"speaker": "you", "speaker_raw": "You",
+                    "text": ask_text, "ts": int(time.time() * 1000),
+                    "request_id": request_id}
+        log.info(f"Sugerir ({request_id}): total_conversation={len(self._conversation)} vault_search={self.vault_search} ai_configured={self._ai_configured()}")
+        if self._ai_configured():
+            ai_telemetry: Dict[str, Any] = {
+                "request_id": request_id,
+                "ask_wait_ms": round((time.monotonic() - request_started) * 1000.0, 1),
+            }
+            try:
+                results = []
+                kb_ms = 0.0
+                if self.vault_search:
+                    log.info(f"Sugerir ({request_id}): vault_search=True, buscando KB...")
+                    kb_started = time.monotonic()
+                    results = self.kb.search(ask_text, top_k=kb_top_k, min_score=min_score)
+                    kb_ms = round((time.monotonic() - kb_started) * 1000.0, 1)
+                else:
+                    log.info(f"Sugerir ({request_id}): vault_search=False, saltando KB")
+                ai_telemetry["kb_ms"] = kb_ms
+                log.info(f"Sugerir ({request_id}): ask_text=\"{ask_text[:60]}\" → {len(results)} chunks, vault_search={self.vault_search}")
+                answer = await self._ai_answer_stream(
+                    "you", ask_text, results, request_id, emit, ai_telemetry)
+                if self.debug:
+                    metric = {
+                        "event": "ai_answer",
+                        "ts": evt_base["ts"],
+                        "request_id": request_id,
+                        "question_chars": len(ask_text),
+                        "total_ms": round((time.monotonic() - request_started) * 1000.0, 1),
+                        "ok": True,
+                        **ai_telemetry,
+                    }
+                    self._record_debug_metric(metric)
+                    prompt_tokens = metric.get("prompt_tokens", "?")
+                    completion_tokens = metric.get("completion_tokens", "?")
+                    emit({
+                        "type": "debug",
+                        "metric": "ai_answer",
+                        "request_id": request_id,
+                        "line": (f"IA {metric.get('model', '?')} "
+                                 f"{metric.get('ai_ms', 0.0):.0f}ms · "
+                                 f"espera+KB {ai_telemetry.get('ask_wait_ms', 0.0):.0f}+{kb_ms:.0f}ms · "
+                                 f"tokens {prompt_tokens}→{completion_tokens} · "
+                                 f"{metric.get('result_count', 0)} notas"),
+                        "detail": self._truncate_debug_text(
+                            f"pregunta: {ask_text[:300]}\n"
+                            f"respuesta cruda: {metric.get('raw', '')}",
+                            1200),
+                        "ts": evt_base["ts"],
+                    })
+                if answer and answer.strip():
+                    safe_results = results if self.vault_search else []
+                    if safe_results:
+                        log.info(f"Sugerir ({request_id}): FINAL kb_hit, results={len(safe_results)} answer=\"{answer[:80]}...\"")
+                        self.session_log.append({
+                            "ts": evt_base["ts"], "type": "kb_hit",
+                            "speaker": "you", "text": ask_text,
+                            "answer": answer.strip()[:900],
+                            "sources": [r["file_path"] for r in safe_results[:4]],
+                            "request_id": request_id,
+                        })
+                    else:
+                        log.info(f"Sugerir ({request_id}): FINAL ai_answer, answer=\"{answer[:80]}...\"")
+                        self.session_log.append({
+                            "ts": evt_base["ts"], "type": "ai_answer",
+                            "speaker": "you", "text": ask_text,
+                            "answer": answer.strip()[:900],
+                            "model": self.ai.config.get_model("kb_fallback").name,
+                            "request_id": request_id,
+                        })
+                else:
+                    log.warning(f"Sugerir ({request_id}): IA devolvió respuesta vacía")
+                    emit({**evt_base, "type": "ai_error",
+                          "error": "IA devolvió respuesta vacía."})
+                    self.session_log.append({
+                        "ts": evt_base["ts"], "type": "ai_error",
+                        "speaker": "you", "text": ask_text,
+                        "error": "IA devolvió respuesta vacía.",
+                        "request_id": request_id,
+                    })
+            except StreamInterruptedError as exc:
+                # El evento ai_stream_error ya llegó al feed; aquí solo queda
+                # el registro final, sin duplicar la entrada visible.
+                if self.debug:
+                    metric = {
+                        "event": "ai_answer",
+                        "ts": evt_base["ts"],
+                        "request_id": request_id,
+                        "question_chars": len(ask_text),
+                        "total_ms": round((time.monotonic() - request_started) * 1000.0, 1),
+                        "ok": False,
+                        "incomplete": True,
+                        "partial": exc.partial[:900],
+                        "error": str(exc)[:300],
+                        **ai_telemetry,
+                    }
+                    self._record_debug_metric(metric)
+                log.warning(f"Sugerir ({request_id}): stream interrumpido: {exc}")
+                self.session_log.append({
+                    "ts": evt_base["ts"], "type": "ai_error",
+                    "speaker": "you", "text": ask_text,
+                    "error": str(exc)[:300],
+                    "partial": exc.partial[:900],
+                    "incomplete": True,
+                    "request_id": request_id,
+                })
+                return
+            except Exception as e:
+                if self.debug:
+                    metric = {
+                        "event": "ai_answer",
+                        "ts": evt_base["ts"],
+                        "request_id": request_id,
+                        "question_chars": len(ask_text),
+                        "total_ms": round((time.monotonic() - request_started) * 1000.0, 1),
+                        "ok": False,
+                        "error": str(e)[:300],
+                    }
+                    self._record_debug_metric(metric)
+                    emit({
+                        "type": "debug",
+                        "metric": "ai_answer",
+                        "request_id": request_id,
+                        "line": (f"IA falló en {metric['total_ms']:.0f}ms "
+                                 f"(pregunta {metric['question_chars']} caracteres)"),
+                        "detail": metric["error"],
+                        "ts": evt_base["ts"],
+                    })
+                log.warning(f"Sugerir ({request_id}): ask AI error: {e}")
+                emit({**evt_base, "type": "ai_error", "error": str(e)[:300]})
+                self.session_log.append({
+                    "ts": evt_base["ts"], "type": "ai_error",
+                    "speaker": "you", "text": ask_text, "error": str(e)[:300],
+                    "request_id": request_id,
+                })
+        else:
+            log.info(f"Sugerir ({request_id}): IA NO configurada, vault_search={self.vault_search}")
+            if self.vault_search:
+                kb_result = self._build_kb_context({"text": ask_text})
+                if kb_result:
+                    emit({**evt_base, "type": "kb_hit",
+                          "sources": kb_result["sources"],
+                          "answer": kb_result["answer"][:600]})
+                    self.session_log.append({
+                        "ts": evt_base["ts"], "type": "kb_hit",
+                        "speaker": "you", "text": ask_text,
+                        "answer": kb_result["answer"][:600],
+                        "sources": [s["file_path"] for s in kb_result["sources"][:4]],
+                        "request_id": request_id,
+                    })
+                else:
+                    emit({**evt_base, "type": "ai_error",
+                          "error": "IA no configurada y KB sin resultados."})
+            else:
+                emit({**evt_base, "type": "ai_error",
+                      "error": "IA no configurada y búsqueda en vault desactivada."})
+
+    @staticmethod
+    def _truncate_debug_text(value: object, limit: int = 2000) -> str:
+        text = "" if value is None else str(value)
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "…[recortado]"
+
+    def _debug_metrics_path(self) -> Path:
+        stem = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.metrics_started_at_ms / 1000))
+        return self.metrics_dir / f"session_{stem}_{os.getpid():06d}.jsonl"
+
+    def _record_debug_metric(self, record: Dict) -> None:
+        """Guarda una métrica en memoria y en JSONL incremental.
+
+        Solo hace algo cuando el modo debug está ON. Nunca guarda claves de
+        API: la telemetría de IA solo conserva modelo, uso y respuesta.
+        """
+        if not self.debug:
+            return
+        try:
+            entry = {"session_id": self.metrics_session_id, **record}
+            if self.metrics_path is None:
+                self.metrics_dir.mkdir(parents=True, exist_ok=True)
+                self.metrics_path = self._debug_metrics_path()
+            self.metrics_records.append(entry)
+            with open(self.metrics_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            log.warning(f"No se pudo guardar la métrica de debug: {e}")
+
+    def _close_debug_metrics(self) -> Optional[Dict[str, str]]:
+        """Escribe el CSV resumen de la sesión a partir del JSONL en memoria."""
+        if not self.debug or not self.metrics_records or self.metrics_path is None:
+            return None
+        try:
+            csv_path = self.metrics_path.with_suffix(".csv")
+            fields: List[str] = []
+            for record in self.metrics_records:
+                for key, value in record.items():
+                    if key not in fields and not isinstance(value, (dict, list)):
+                        fields.append(key)
+            with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(self.metrics_records)
+            return {"jsonl": str(self.metrics_path), "csv": str(csv_path)}
+        except Exception as e:
+            log.warning(f"No se pudo escribir el CSV de debug: {e}")
+            return None
 
     @staticmethod
     def _parse_json_answer(raw: str) -> Optional[Dict]:
@@ -205,7 +543,12 @@ class MeetingAuditor:
             "query": (data.get("query") or "").strip()[:200],
         }
 
-    async def _ai_answer(self, side: str, text: str, results: List[Dict]) -> str:
+    def _build_answer_messages(self, side: str, text: str, results: List[Dict]):
+        """Construye system/user/messages idénticos para la respuesta IA.
+
+        Se comparte entre la ruta sincrónica y la ruta streaming para no
+        duplicar prompts ni provocar deriva entre ambos modos.
+        """
         convo = self._conversation_block(max_items=6)
         who = "Tú" if side == "you" else "Remoto"
         log.info(f"_ai_answer: results={len(results)} vault_search={self.vault_search} text=\"{text[:50]}\"")
@@ -261,10 +604,202 @@ class MeetingAuditor:
                     f"{who}: \"{text}\"\n\n"
                     "(No hay chunks relevantes en el vault.)\n\nRespuesta:"
                 )
-        return await self.ai.chat_completion(
-            [{"role": "system", "content": system},
-             {"role": "user", "content": user}],
-            task="kb_fallback", temperature=0.2, max_tokens=500)
+        return system, user, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    async def _ai_answer(self, side: str, text: str, results: List[Dict],
+                         telemetry: Optional[Dict] = None) -> str:
+        system, user, messages = self._build_answer_messages(side, text, results)
+        prompt_chars = len(system) + len(user)
+        info: Dict[str, Any] = {}
+        answer = await self.ai.chat_completion(
+            messages, task="kb_fallback", temperature=0.2, max_tokens=500,
+            capture=info)
+        if telemetry is not None:
+            telemetry.update({
+                "ok": info.get("ok", True),
+                "model": info.get("response_model", info.get("configured_model", "")),
+                "endpoint": self.ai.config.base_url if self.ai else "",
+                "prompt_chars": prompt_chars,
+                "answer_chars": len(answer or ""),
+                "prompt_tokens": info.get("prompt_tokens"),
+                "completion_tokens": info.get("completion_tokens"),
+                "total_tokens": info.get("total_tokens"),
+                "ai_ms": info.get("duration_ms", 0.0),
+                "temperature": info.get("temperature"),
+                "max_tokens": info.get("max_tokens"),
+                "result_count": len(results),
+                "raw": self._truncate_debug_text(info.get("raw", "")),
+            })
+        return answer
+
+    async def _ai_answer_stream(self, side: str, text: str, results: List[Dict],
+                                request_id: str, emit,
+                                telemetry: Optional[Dict] = None) -> str:
+        """Responde en streaming y emite deltas progresivos por lotes.
+
+        El llamador conserva la respuesta final como única entrada persistente.
+        """
+        system, user, messages = self._build_answer_messages(side, text, results)
+        model = self.ai.config.get_model("kb_fallback").name
+        kind = "kb_hit" if self.vault_search and results else "ai_answer"
+        sources = (
+            [{"file_path": r["file_path"], "score": round(r["score"], 3)}
+             for r in results[:4]]
+            if kind == "kb_hit" else []
+        )
+        ts = int(time.time() * 1000)
+        stats: Dict[str, Any] = {}
+        emit({
+            "type": "ai_stream_start",
+            "request_id": request_id,
+            "kind": kind,
+            "speaker": side,
+            "speaker_raw": "You" if side == "you" else "Remote",
+            "text": text,
+            "model": model,
+            "sources": sources,
+            "answer": "",
+            "streaming": True,
+            "ts": ts,
+        })
+        full_text = ""
+        pending = ""
+        last_flush = time.monotonic()
+        first_delta_sent = False
+        stream_started = time.monotonic()
+        try:
+            async for delta in self.ai.chat_completion_stream(
+                messages, task="kb_fallback", temperature=0.2,
+                max_tokens=500, stats=stats,
+            ):
+                full_text += delta
+                pending += delta
+                now = time.monotonic()
+                if (not first_delta_sent or len(pending) >= 64
+                        or now - last_flush >= 0.075):
+                    emit({
+                        "type": "ai_stream_delta",
+                        "request_id": request_id,
+                        "delta": pending,
+                        "ts": int(time.time() * 1000),
+                    })
+                    pending = ""
+                    last_flush = now
+                    first_delta_sent = True
+            if pending:
+                emit({
+                    "type": "ai_stream_delta",
+                    "request_id": request_id,
+                    "delta": pending,
+                    "ts": int(time.time() * 1000),
+                })
+            answer = full_text.strip()
+            if not answer:
+                # Sin tokens utilizables: fallback sincrónico preserva la UX.
+                log.info(f"Sugerir ({request_id}): stream sin tokens; usando respuesta completa")
+                stats["stream_fallback"] = "no-tokens"
+                if telemetry is not None:
+                    telemetry["stream_fallback"] = "no-tokens"
+                answer = await self._ai_answer(side, text, results, telemetry)
+                emit({
+                    "type": "ai_stream_done",
+                    "request_id": request_id,
+                    "kind": kind,
+                    "answer": answer[:900],
+                    "sources": sources,
+                    "model": model,
+                    "streaming": False,
+                    "ts": int(time.time() * 1000),
+                })
+                return answer
+            if telemetry is not None:
+                telemetry.update({
+                    "ok": True,
+                    "model": stats.get("response_model", stats.get("requested_model", model)),
+                    "endpoint": self.ai.config.base_url if self.ai else "",
+                    "prompt_chars": len(system) + len(user),
+                    "answer_chars": len(answer),
+                    "prompt_tokens": stats.get("prompt_tokens"),
+                    "completion_tokens": stats.get("completion_tokens"),
+                    "total_tokens": stats.get("total_tokens"),
+                    "ai_ms": round((time.monotonic() - stream_started) * 1000.0, 1),
+                    "temperature": stats.get("temperature", 0.2),
+                    "max_tokens": stats.get("max_tokens", 500),
+                    "result_count": len(results),
+                    "stream_mode": True,
+                    "stream_chunks": stats.get("stream_chunks", 0),
+                    "stream_chars": stats.get("stream_chars", 0),
+                    "reasoning_chars": stats.get("reasoning_chars", 0),
+                    "reasoning": self._truncate_debug_text(stats.get("reasoning", "")),
+                    "raw": self._truncate_debug_text(answer),
+                    "first_token_ms": (
+                        round((stats["first_token_at"] - stats["sent_at"]) * 1000.0, 1)
+                        if stats.get("first_token_at") and stats.get("sent_at") else None
+                    ),
+                    "stream_options_supported": stats.get("stream_options_supported", True),
+                    "non_sse_response": stats.get("non_sse_response", False),
+                })
+            emit({
+                "type": "ai_stream_done",
+                "request_id": request_id,
+                "kind": kind,
+                "answer": answer[:900],
+                "sources": sources,
+                "model": model,
+                "streaming": False,
+                "ts": int(time.time() * 1000),
+            })
+            return answer
+        except Exception as exc:
+            stats["stream_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            if not full_text.strip() and not stats.get("received_text", False):
+                # El stream falló antes de mostrar texto: el fallback normal
+                # conserva la UX y el placeholder recibe su evento final.
+                log.info(f"Sugerir ({request_id}): stream sin texto visible; usando respuesta completa")
+                stats["stream_fallback"] = "stream-error"
+                if telemetry is not None:
+                    telemetry["stream_fallback"] = "stream-error"
+                answer = await self._ai_answer(side, text, results, telemetry)
+                emit({
+                    "type": "ai_stream_done",
+                    "request_id": request_id,
+                    "kind": kind,
+                    "answer": answer[:900],
+                    "sources": sources,
+                    "model": model,
+                    "streaming": False,
+                    "ts": int(time.time() * 1000),
+                })
+                return answer
+            if not full_text.strip():
+                # Sin texto visible: el llamador puede usar el fallback normal.
+                raise
+            partial = full_text.strip()
+            emit({
+                "type": "ai_stream_error",
+                "request_id": request_id,
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+                "partial": partial[:900],
+                "ts": int(time.time() * 1000),
+            })
+            if telemetry is not None:
+                telemetry.update({
+                    "ok": False,
+                    "model": model,
+                    "endpoint": self.ai.config.base_url if self.ai else "",
+                    "prompt_chars": len(system) + len(user),
+                    "answer_chars": len(partial),
+                    "stream_mode": True,
+                    "stream_chunks": stats.get("stream_chunks", 0),
+                    "stream_chars": stats.get("stream_chars", 0),
+                    "reasoning_chars": stats.get("reasoning_chars", 0),
+                    "result_count": len(results),
+                    "error": stats["stream_error"],
+                })
+            raise StreamInterruptedError(stats["stream_error"], partial) from exc
 
     async def _process_with_ai(self, evt_base: Dict, side: str, text: str) -> None:
         """Pipeline RAG: IA decide/refina → KB → IA redacta citando (o responde
@@ -324,7 +859,7 @@ class MeetingAuditor:
             "speaker_raw": speaker_raw,
             "text": text,
         })
-        self._remember(side, text)
+        self._remember(side, text, utterance.get("ts"))
 
         # Fase 3: si auto_reply está OFF, solo emitimos captions (sin IA/KB)
         if not self.auto_reply:
@@ -488,14 +1023,23 @@ class MeetingAuditor:
                            vad_threshold: float = 0.003,
                            min_silence_secs: float = 0.8,
                            max_phrase_secs: float = 15.0,
-                           whisper_url: Optional[str] = None) -> None:
+                           whisper_url: Optional[str] = None,
+                           debug: bool = False) -> None:
         """Feed en vivo por FRASES (Fase 6): captura continua (mic → You,
         loopback → Remote) con corte por fin-de-frase (VAD), transcribe cada
         frase con el whisper-server HTTP persistente (modelo caliente en VRAM,
-        ~0.4-0.7s/frase) y emite captions. Push-to-ask (Fase 4) intacto: señal
-        ask_start/ask_end → graba aparte → transcribe (whisper-server) → IA
-        con contexto de los últimos captions."""
+        ~0.4-0.7s/frase) y emite captions. Sugerir (Sprint 1) usa solicitudes
+        explícitas de un clic y responde con transcripción reciente + contexto
+        de los últimos captions."""
         from audio_capture import LiveCapture, _default_mic_source, _default_loopback_source
+
+        # El toggle se congela al arrancar la reunión: cambiarlo en Settings
+        # aplica a la próxima reunión, no a un proceso ya en ejecución.
+        self.debug = debug or os.environ.get("AUDITOR_DEBUG", "").lower() in ("true", "1", "yes")
+        self.metrics_started_at_ms = int(time.time() * 1000)
+        self.metrics_session_id = f"{self.metrics_started_at_ms}-{os.getpid():06d}"
+        self.metrics_path = None
+        self.metrics_records = []
 
         # Motor de transcripción: whisper-server persistente. Si no puede
         # arrancar, caemos a `voxtype transcribe` (lento pero funcional).
@@ -530,6 +1074,7 @@ class MeetingAuditor:
             except (NotImplementedError, RuntimeError):
                 pass
 
+        whisper_boot_started = time.monotonic()
         whisper_ready = asyncio.create_task(whisper.ensure())
         try:
             await cap.start()
@@ -541,6 +1086,7 @@ class MeetingAuditor:
         finally:
             if not whisper_ready.done():
                 whisper_ready.cancel()
+        whisper_boot_ms = (time.monotonic() - whisper_boot_started) * 1000.0
         if not ok:
             log.warning("whisper-server no disponible — usando voxtype transcribe (lento)")
             emit({"type": "info",
@@ -552,162 +1098,75 @@ class MeetingAuditor:
                  f"tope={max_phrase_secs}s, umbral VAD={vad_threshold})")
         log.info(f"Fuentes: mic={cap.mic_source!r} loopback={cap.loop_source!r} "
                  f"(loopback None = lado Remote inactivo, sin sink RUNNING/IDLE)")
+        if self.debug:
+            startup = {
+                "event": "startup",
+                "ts": int(time.time() * 1000),
+                "backend": "whisper-server" if ok else "voxtype",
+                "whisper_ready": ok,
+                "whisper_boot_ms": round(whisper_boot_ms, 1),
+                "whisper_url": self._whisper.url,
+                "whisper_model": Path(self._whisper.model).name,
+                "vad_threshold": vad_threshold,
+                "min_silence_secs": min_silence_secs,
+                "max_phrase_secs": max_phrase_secs,
+            }
+            self._record_debug_metric(startup)
+            emit({
+                "type": "debug",
+                "metric": "startup",
+                "line": (f"motor={startup['backend']} "
+                         f"boot={startup['whisper_boot_ms']:.0f}ms · "
+                         f"modelo={startup['whisper_model']} · "
+                         f"VAD={vad_threshold}"),
+                "detail": f"URL={startup['whisper_url']}",
+                "ts": startup["ts"],
+            })
 
-        # ── Push-to-ask (Fase 4) ────────────────────────────────────────────
-        # Protocolo con MARCADORES SEPARADOS (ask_start / ask_end): el QML usa
-        # `touch`, por lo que un start no puede ser pisado por un end.
+        # ── Sugerir con un clic (Sprint 1) ───────────────────────────────────
+        # Cada pulsación crea un JSON único y atómico en ask_dir. El backend lo
+        # consume una vez y responde con la transcripción reciente + contexto.
+        # No se usa mantener presionado ni el intervalo entre dos marcadores.
         #
         # IMPORTANTE: NO se graba audio aparte con pw-record. Intentar una
         # segunda captura sobre la misma fuente (el VAD principal ya la tiene)
         # hace que PipeWire no alimente el WAV del ask → "no se detectó voz"
-        # aunque el usuario esté hablando su pregunta SÍ aparece en el feed
-        # (porque el VAD principal la transcribe). Rediseño: al presionar se
-        # marca el instante y al soltar se recolectan las frases ya transcritas
-        # por el VAD en ese lapso (self._spoken) y se corre el RAG con ellas.
+        # aunque el usuario esté hablando. La pregunta y el contexto ya vienen
+        # del feed transcrito por el VAD principal.
         ask_dir = cap.tmp_dir
-        ask_start_file = ask_dir / "ask_start"
-        ask_end_file = ask_dir / "ask_end"
         ask_dir.mkdir(parents=True, exist_ok=True)
-        for stale in (ask_start_file, ask_end_file):
+        stale_requests = list(ask_dir.glob(f"{ASK_REQUEST_PREFIX}*{ASK_REQUEST_SUFFIX}"))
+        stale_requests += list(ask_dir.glob(".ask_request_*.tmp"))
+        for stale in stale_requests + [ask_dir / "ask_start", ask_dir / "ask_end"]:
             try:
                 stale.unlink(missing_ok=True)
             except Exception:
                 pass
-        self._ask_buffering = False
-        self._ask_start_idx = 0
-        # Frases UNICAMENTE transcritas (side, text, ts) para el push-to-ask.
-        # Se alimenta desde _transcribe (abajo) cuando emite un enunciado.
-        self._spoken: List[Tuple[int, str, str]] = []
 
-        async def _end_ask_rag(start_idx: int) -> None:
-            """Recolecta las frases del lapso de la pulsación y corre el RAG.
-
-            La frase que el usuario dice MIENTRAS mantiene el botón se cierra
-            (VAD: 0.8s de silencio) y se transcribe (whisper ~0.5s) DESPUÉS de
-            soltar. Por eso esperamos aquí: a que `self._spoken` crezca con
-            frases nuevas (nuevos índices desde `start_idx`) antes de armar la
-            pregunta. Sin esto, el ask se ejecutaba a los 1.5s fijos y la frase
-            todavía estaba en vuelo → "no se detectó voz" aunque el texto
-            aparecía en el feed.
-            """
-            log.info("Push-to-ask FIN — consultando IA…")
-            emit({"type": "info", "msg": "💭 Pensando…"})
-            # Esperar a que las frases en vuelo se cierren y transcriban
-            # (hasta ~8s; suelta antes si ya llegó contenido nuevo).
-            deadline = time.monotonic() + 8.0
-            while time.monotonic() < deadline:
-                if len(self._spoken) > start_idx:
-                    break
-                await asyncio.sleep(0.2)
-            await asyncio.sleep(0.5)
-            parts = []
-            for ts, side, text in self._spoken[start_idx:]:
-                who = "Tú" if side == "you" else "Remoto"
-                parts.append(f"{who}: {text}")
-            # dedupe conservando orden (una frase puede cerrarse 2 veces? no)
-            seen = set()
-            uniq = []
-            for p in parts:
-                if p not in seen:
-                    seen.add(p)
-                    uniq.append(p)
-            ask_text = " | ".join(uniq) if uniq else ""
-            if not ask_text:
-                log.info("Push-to-ask: sin voz en el lapso de pulsación")
-                emit({"type": "info", "msg": "No se detectó voz durante la pulsación."})
-                return
-            log.info(f"Push-to-ask: {ask_text[:120]}")
-            evt_base = {"speaker": "you", "speaker_raw": "You",
-                        "text": ask_text, "ts": int(time.time() * 1000)}
-            log.info(f"_end_ask_rag: start_idx={start_idx} total_spoken={len(self._spoken)} vault_search={self.vault_search} ai_configured={self._ai_configured()}")
-            if self._ai_configured():
-                try:
-                    results = []
-                    if self.vault_search:
-                        log.info(f"_end_ask_rag: vault_search=True, buscando KB...")
-                        results = self.kb.search(ask_text, top_k=5, min_score=0.20)
-                    else:
-                        log.info(f"_end_ask_rag: vault_search=False, saltando KB")
-                    log.info(f"_end_ask_rag: ask_text=\"{ask_text[:60]}\" → {len(results)} chunks, vault_search={self.vault_search}")
-                    answer = await self._ai_answer("you", ask_text, results)
-                    if answer and answer.strip():
-                        safe_results = results if self.vault_search else []
-                        if safe_results:
-                            log.info(f"_end_ask_rag: EMIT kb_hit, results={len(safe_results)} answer=\"{answer[:80]}...\"")
-                            emit({**evt_base, "type": "kb_hit",
-                                  "sources": [{"file_path": r["file_path"],
-                                               "score": round(r["score"], 3)}
-                                              for r in safe_results[:4]],
-                                  "answer": answer.strip()[:900]})
-                            self.session_log.append({
-                                "ts": evt_base["ts"], "type": "kb_hit",
-                                "speaker": "you", "text": ask_text,
-                                "answer": answer.strip()[:900],
-                                "sources": [r["file_path"] for r in safe_results[:4]],
-                            })
-                        else:
-                            log.info(f"_end_ask_rag: EMIT ai_answer, answer=\"{answer[:80]}...\"")
-                            emit({**evt_base, "type": "ai_answer",
-                                  "model": self.ai.config.get_model("kb_fallback").name,
-                                  "answer": answer.strip()[:900]})
-                            self.session_log.append({
-                                "ts": evt_base["ts"], "type": "ai_answer",
-                                "speaker": "you", "text": ask_text,
-                                "answer": answer.strip()[:900],
-                                "model": self.ai.config.get_model("kb_fallback").name,
-                            })
-                except Exception as e:
-                    log.warning(f"ask AI error: {e}")
-                    emit({**evt_base, "type": "ai_error", "error": str(e)[:300]})
-                    self.session_log.append({
-                        "ts": evt_base["ts"], "type": "ai_error",
-                        "speaker": "you", "text": ask_text, "error": str(e)[:300],
-                    })
-            else:
-                log.info(f"_end_ask_rag: IA NO configurada, vault_search={self.vault_search}")
-                if self.vault_search:
-                    kb_result = self._build_kb_context({"text": ask_text})
-                    if kb_result:
-                        emit({**evt_base, "type": "kb_hit",
-                              "sources": kb_result["sources"],
-                              "answer": kb_result["answer"][:600]})
-                        self.session_log.append({
-                            "ts": evt_base["ts"], "type": "kb_hit",
-                            "speaker": "you", "text": ask_text,
-                            "answer": kb_result["answer"][:600],
-                            "sources": [s["file_path"] for s in kb_result["sources"][:4]],
-                        })
-                    else:
-                        emit({**evt_base, "type": "ai_error",
-                              "error": "IA no configurada y KB sin resultados."})
-                else:
-                    emit({**evt_base, "type": "ai_error",
-                          "error": "IA no configurada y búsqueda en vault desactivada."})
-
-        async def _watch_ask_commands():
-            """Vigila ask_start/ask_end cada 200ms (marcadores independientes)."""
+        async def _watch_suggest_requests():
+            """Vigila solicitudes explícitas de sugerencia, una por clic."""
             while True:
                 try:
-                    if ask_start_file.exists() and not self._ask_buffering:
-                        try:
-                            self._ask_buffering = True
-                            self._ask_start_idx = len(self._spoken)
-                            log.info(f"🎤 Push-to-ask INICIO (start_idx={self._ask_start_idx})")
-                            emit({"type": "info", "msg": "🎤 Preguntando… habla ahora"})
-                        finally:
-                            ask_start_file.unlink(missing_ok=True)
-                    if ask_end_file.exists() and self._ask_buffering:
-                        try:
-                            self._ask_buffering = False
-                            await _end_ask_rag(self._ask_start_idx)
-                        finally:
-                            ask_end_file.unlink(missing_ok=True)
+                    try:
+                        request_paths = sorted(
+                            ask_dir.glob(f"{ASK_REQUEST_PREFIX}*{ASK_REQUEST_SUFFIX}"),
+                            key=lambda path: (path.stat().st_mtime_ns, path.name),
+                        )
+                    except OSError:
+                        request_paths = []
+                    for request_path in request_paths:
+                        request = self._consume_suggest_request(request_path)
+                        if request is None:
+                            continue
+                        request_id, _, context_phrases = request
+                        await self._suggest_recent_question(request_id, context_phrases)
                 except Exception:
                     pass
                 await asyncio.sleep(0.2)
 
-        # Arrancar vigía de comandos push-to-ask en paralelo
-        ask_watcher = asyncio.create_task(_watch_ask_commands())
+        # Arrancar el vigilante de Sugerir en paralelo
+        ask_watcher = asyncio.create_task(_watch_suggest_requests())
+
 
         # helper de transcripción compartido por captions y push-to-ask
         # ── Dedupe anti-eco (Issue 7.2) ─────────────────────────────────────
@@ -740,7 +1199,12 @@ class MeetingAuditor:
             return any(now - ts < within_ms and s == side and t == tn
                        for ts, s, t in _recent)
 
-        async def _transcribe(wav: Path, side: str, speaker_raw: str) -> None:
+        async def _transcribe(wav: Path, side: str, speaker_raw: str,
+                              peak_rms: float = 0.0,
+                              closed_at_ms: float = 0.0,
+                              secs: float = 0.0) -> None:
+            dispatch_wall_ms = time.time() * 1000.0
+            transcribe_started = time.monotonic()
             try:
                 if self._transcribe_engine is not None:
                     text = await self._transcribe_engine.transcribe(wav)
@@ -752,17 +1216,59 @@ class MeetingAuditor:
             except Exception as e:
                 log.warning(f"Transcripción falló: {e}")
                 return
+            asr_ms = (time.monotonic() - transcribe_started) * 1000.0
             text = (text or "").strip()
             if not text or len(text) < 2:
                 return
             now = int(time.time() * 1000)
+            if self.debug:
+                try:
+                    wav_bytes = wav.stat().st_size
+                except OSError:
+                    wav_bytes = 0
+                backend = ("whisper-server"
+                           if self._transcribe_engine is not None
+                           else "voxtype")
+                model = (Path(self._whisper.model).name
+                         if self._transcribe_engine is not None else "")
+                queue_ms = (round(dispatch_wall_ms - closed_at_ms, 1)
+                            if closed_at_ms > 0 else 0.0)
+                metric = {
+                    "event": "utterance",
+                    "ts": now,
+                    "side": side,
+                    "speaker_raw": speaker_raw,
+                    "text_chars": len(text),
+                    "phrase_secs": round(secs, 2),
+                    "peak_rms": round(peak_rms, 5),
+                    "vad_queue_ms": queue_ms,
+                    "asr_ms": round(asr_ms, 1),
+                    "total_ms": round(now - dispatch_wall_ms, 1),
+                    "backend": backend,
+                    "model": model,
+                    "wav_bytes": wav_bytes,
+                }
+                self._record_debug_metric(metric)
+                emit({
+                    "type": "debug",
+                    "metric": "utterance",
+                    "line": (f"VAD→Whisper {metric['asr_ms']:.0f}ms · "
+                             f"cola {metric['vad_queue_ms']:.0f}ms · "
+                             f"frase {metric['phrase_secs']:.2f}s · "
+                             f"pico {metric['peak_rms']:.4f} · "
+                             f"{metric['text_chars']} caracteres"),
+                    "detail": (f"{side}: backend={backend}"
+                               + (f" modelo={model}" if model else "")
+                               + f" WAV={wav_bytes}B"),
+                    "ts": now,
+                })
+
             # podar ventana (12s)
             _recent[:] = [(ts, s, t) for ts, s, t in _recent if now - ts < 12000]
             tn = _norm(text)
             if len(tn) < 4:
                 # sin base para dedupe → emitir directo
                 log.info(f"[{side}] {text[:100]}")
-                self._spoken.append((now, side, text))
                 await self.process_utterance({
                     "speaker": side,
                     "speaker_raw": speaker_raw,
@@ -779,7 +1285,6 @@ class MeetingAuditor:
                     return
                 _recent.append((now, "remote", tn))
                 log.info(f"[remote] {text[:100]}")
-                self._spoken.append((now, side, text))
                 await self.process_utterance({
                     "speaker": "remote",
                     "speaker_raw": speaker_raw,
@@ -790,7 +1295,6 @@ class MeetingAuditor:
                 # you: el mic fijo es la fuente de verdad de la voz del usuario.
                 _recent.append((now, "you", tn))
                 log.info(f"[you] {text[:100]}")
-                self._spoken.append((now, side, text))
                 await self.process_utterance({
                     "speaker": "you",
                     "speaker_raw": speaker_raw,
@@ -807,10 +1311,14 @@ class MeetingAuditor:
                 tasks = []
                 if chunk.mic_wav is not None:
                     tasks.append(asyncio.create_task(
-                        _transcribe(chunk.mic_wav, "you", "You")))
+                        _transcribe(chunk.mic_wav, "you", "You",
+                                    chunk.mic_rms, chunk.closed_at_ms,
+                                    chunk.secs)))
                 if chunk.loop_wav is not None:
                     tasks.append(asyncio.create_task(
-                        _transcribe(chunk.loop_wav, "remote", "Remote")))
+                        _transcribe(chunk.loop_wav, "remote", "Remote",
+                                    chunk.loop_rms, chunk.closed_at_ms,
+                                    chunk.secs)))
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
         finally:
@@ -831,126 +1339,69 @@ class MeetingAuditor:
                     log.info(f"Transcript exacto guardado: {log_path} ({len(self.session_log)} eventos)")
                 except Exception as e:
                     log.warning(f"No se pudo escribir {log_path}: {e}")
+            metrics_paths = self._close_debug_metrics()
+            if metrics_paths:
+                log.info(f"Métricas de debug guardadas: {metrics_paths['jsonl']} y {metrics_paths['csv']}")
+                emit({
+                    "type": "debug",
+                    "metric": "session",
+                    "line": (f"métricas guardadas: {len(self.metrics_records)} "
+                             f"eventos"),
+                    "detail": (f"JSONL={metrics_paths['jsonl']}\n"
+                               f"CSV={metrics_paths['csv']}"),
+                    "ts": int(time.time() * 1000),
+                })
 
     # -- Live meeting: captions rápidos desde transcript.json de voxtype --
     async def live_meeting(self, transcript_path: Optional[Path] = None,
                            poll_interval: float = 0.5) -> None:
         """Modo reunión en vivo: lee el transcript.json que voxtype genera
         en tiempo real (segmentos cada ~2-3s) y los muestra como captions.
-        Push-to-ask: recibe comandos via marcadores ask_start/ask_end,
-        recolecta segmentos del lapso de la pulsación (texto ya transcrito,
-        sin grabar audio)."""
+        Sugerir usa solicitudes explícitas de un clic y responde con la
+        transcripción reciente + contexto."""
         last_seen_id = -1
         last_path: Optional[Path] = None
         running_meeting = True
         log.info("Modo live: vigilando transcript.json (captions rápidos + push-to-ask)")
 
-        # ── Push-to-ask: solo texto, sin pw-record ─────────────────────────
-        # Mismo protocolo de marcadores separados que capture_live (ask_start /
-        # ask_end con touch desde el QML) — un solo ask.cmd perdía comandos por
-        # carrera.
+        # ── Sugerir con un clic ─────────────────────────────────────────────
+        # El modo live usa la misma solicitud explícita que capture_live: cada
+        # clic crea un JSON único y el backend responde con la transcripción
+        # reciente + contexto. No se usa mantener presionado.
         ask_dir = Path("/tmp/voxtype-auditor")
-        ask_start_file = ask_dir / "ask_start"
-        ask_end_file = ask_dir / "ask_end"
         ask_dir.mkdir(parents=True, exist_ok=True)
-        for stale in (ask_start_file, ask_end_file):
+        stale_suggest_requests = list(ask_dir.glob(f"{ASK_REQUEST_PREFIX}*{ASK_REQUEST_SUFFIX}"))
+        stale_suggest_requests += list(ask_dir.glob(".ask_request_*.tmp"))
+        for stale in stale_suggest_requests + [ask_dir / "ask_start", ask_dir / "ask_end"]:
             try:
                 stale.unlink(missing_ok=True)
             except Exception:
                 pass
-        self._ask_buffering = False
-        self._ask_start_id = -1   # último segment ID visto al presionar
-    
-        def _collect_ask_text(segments: List[Dict], since_id: int) -> str:
-            """Recolecta texto de segmentos con id > since_id."""
-            parts = []
-            for seg in segments:
-                try:
-                    sid = int(seg.get("id", -1))
-                except (TypeError, ValueError):
-                    continue
-                if sid > since_id:
-                    text = (seg.get("text") or "").strip()
-                    if text:
-                        parts.append(text)
-            return " ".join(parts) if parts else ""
 
-        async def _watch_ask_commands():
-            """Vigila ask_start/ask_end cada 200ms: start marca tiempo, end
-            recolecta segmentos y ejecuta RAG."""
+        async def _watch_suggest_requests():
+            """Vigila solicitudes explícitas de Sugerir, una por clic."""
             while running_meeting:
                 try:
-                    if ask_start_file.exists() and not self._ask_buffering:
-                        try:
-                            self._ask_buffering = True
-                            self._ask_start_id = last_seen_id
-                            log.info("🎤 Push-to-ask INICIO")
-                            emit({"type": "info", "msg": "🎤 Preguntando… habla ahora"})
-                        finally:
-                            ask_start_file.unlink(missing_ok=True)
-                    if ask_end_file.exists() and self._ask_buffering:
-                        try:
-                            self._ask_buffering = False
-                            log.info("🎤 Push-to-ask FIN — consultando IA…")
-                            emit({"type": "info", "msg": "💭 Pensando…"})
-                            # Esperar un poco para que lleguen segmentos pendientes
-                            await asyncio.sleep(1.5)
-                            # Recolectar texto de segmentos desde ask_start_id
-                            ask_text = ""
-                            if path and path.exists():
-                                try:
-                                    data = json.loads(path.read_text("utf-8"))
-                                    segs = data.get("segments", []) if isinstance(data, dict) else []
-                                    ask_text = _collect_ask_text(segs, self._ask_start_id)
-                                except Exception:
-                                    pass
-                            if not ask_text:
-                                log.info("Push-to-ask: sin segmentos nuevos")
-                                emit({"type": "info", "msg": "No se detectó voz durante la pulsación."})
-                            else:
-                                log.info(f"Push-to-ask: \"{ask_text[:120]}\"")
-                                evt_base = {"speaker": "you", "speaker_raw": "You",
-                                            "text": ask_text, "ts": int(time.time() * 1000)}
-                                await self._execute_ask_rag(evt_base, ask_text)
-                        finally:
-                            ask_end_file.unlink(missing_ok=True)
+                    try:
+                        request_paths = sorted(
+                            ask_dir.glob(f"{ASK_REQUEST_PREFIX}*{ASK_REQUEST_SUFFIX}"),
+                            key=lambda path: (path.stat().st_mtime_ns, path.name),
+                        )
+                    except OSError:
+                        request_paths = []
+                    for request_path in request_paths:
+                        request = self._consume_suggest_request(request_path)
+                        if request is None:
+                            continue
+                        request_id, _, context_phrases = request
+                        await self._suggest_recent_question(request_id, context_phrases)
                 except Exception:
                     pass
                 await asyncio.sleep(0.2)
 
-        async def _execute_ask_rag(evt_base: Dict, ask_text: str) -> None:
-            """Ejecuta RAG para push-to-ask: busca vault si está habilitado,
-            IA decide relevancia y responde."""
-            if self._ai_configured():
-                results = []
-                if self.vault_search:
-                    results = self.kb.search(ask_text, top_k=5, min_score=self.kb_threshold)
-                answer = await self._ai_answer("you", ask_text, results)
-                if answer and answer.strip():
-                    if results:
-                        emit({**evt_base, "type": "kb_hit",
-                              "sources": [{"file_path": r["file_path"],
-                                           "score": round(r["score"], 3)}
-                                          for r in results[:4]],
-                              "answer": answer.strip()[:900]})
-                    else:
-                        emit({**evt_base, "type": "ai_answer",
-                              "model": self.ai.config.get_model("kb_fallback").name,
-                              "answer": answer.strip()[:900]})
-            else:
-                # Sin IA: búsqueda KB directa
-                if self.vault_search:
-                    kb_result = self._build_kb_context({"text": ask_text})
-                    if kb_result:
-                        emit({**evt_base, "type": "kb_hit",
-                              "sources": kb_result["sources"],
-                              "answer": kb_result["answer"][:600]})
-                        return
-                emit({**evt_base, "type": "ai_error",
-                      "error": "IA no configurada y sin resultados del vault."})
+        # Arrancar el vigilante de Sugerir
+        ask_watcher = asyncio.create_task(_watch_suggest_requests())
 
-        # Arrancar watcher de push-to-ask
-        ask_watcher = asyncio.create_task(_watch_ask_commands())
 
         try:
             while running_meeting:
@@ -1198,6 +1649,8 @@ async def main():
                            help="Tope de duración por frase (default 15s)")
     p_capture.add_argument("--whisper-url", default=None,
                            help="URL del whisper-server (default env AUDITOR_WHISPER_URL o http://127.0.0.1:8177)")
+    p_capture.add_argument("--debug", action="store_true",
+                           help="Emitir métricas de debug y guardar JSONL/CSV por sesión")
 
     p_live = sub.add_parser("live", help="Modo reunión en vivo: lee transcript.json de voxtype (captions rápidos ~2-3s) + push-to-ask")
     p_live.add_argument("transcript", nargs="?", default=None,
@@ -1266,7 +1719,8 @@ async def main():
                                        vad_threshold=args.vad_threshold,
                                        min_silence_secs=args.min_silence_secs,
                                        max_phrase_secs=args.max_phrase_secs,
-                                       whisper_url=args.whisper_url)
+                                       whisper_url=args.whisper_url,
+                                       debug=args.debug)
     elif args.cmd == "live":
         async with OmniRouteClient(ai_cfg) as ai:
             auditor.ai = ai

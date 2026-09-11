@@ -287,6 +287,9 @@ usuario habla 3 frases en español + 1 push-to-ask) → validar en el feed.
    → **RESUELTO (2026-09-08)**: reutilizar **ScrollLock en modo reunión** como
    push-to-ask (el push-to-talk de dictado pasa a ser push-to-ask durante
    reuniones activas), **+ botón "Preguntar" en el panel** para ratón.
+   → **ACTUALIZADO (Sprint 1, 2026-09-11)**: se eliminó mantener presionado.
+   El panel usa un clic en **“Sugerir”**; ScrollLock vuelve a ser solo dictado
+   normal.
 2. ¿El RAG automático actual se elimina por completo (default) o queda detrás
    de un toggle OFF por defecto?
    → **RESUELTO**: toggle "Respuestas automáticas" en Settings, **default OFF**
@@ -294,6 +297,9 @@ usuario habla 3 frases en español + 1 push-to-ask) → validar en el feed.
 3. Contexto enviado a la IA: ¿últimas N frases (¿cuántas?) o toda la reunión?
    → **RESUELTO**: últimas **~10 frases** de la reunión + lo hablado durante
    la pulsación.
+   → **ACTUALIZADO (Sprint 1, 2026-09-11)**: se eliminó la pulsación larga.
+   “Sugerir” usa un clic, crea una solicitud explícita y responde con las
+   últimas 10 frases + contexto. ScrollLock vuelve a ser solo dictado normal.
 4. ¿El botón "Probar conexión" va en Settings (panel DMS) o en el popout del
    widget de barra?
    → **RESUELTO**: en **Settings → Plugins → VoxType**, junto a los campos de

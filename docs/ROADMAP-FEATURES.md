@@ -55,11 +55,10 @@ propio (vault Obsidian / OpenNotebook) + local + gratis + extensible.**
    esté migrado a Armbian.
 5. **OpenNotebook se ejecuta en el PC por ahora**; migrar al OPI cuando termine
    la instalación de Armbian (decisión del usuario, 2026-09-11).
-6. **Streaming de IA = prioridad de sprint 1**: implementar
-   `chat_completion_stream` (hoy `NotImplementedError` en
-   `omniroute_client.py:167`) y renderizar tokens progresivos. Objetivo: bajar
-   latencia percibida de ~4-6s a ~1-2s (que el interlocutor remoto no note
-   espera — "es time-critical").
+6. **Streaming de IA = prioridad de sprint 1**: `chat_completion_stream`
+    endurecido y renderizado de tokens progresivos solo en “Sugerir”. Objetivo:
+    bajar latencia percibida de ~4-6s a ~1-2s (que el interlocutor remoto no
+    note espera — "es time-critical").
 7. **Modo debug**: toggle ON/OFF (default OFF), en vivos muestra latencia
    VAD→whisper→IA por etapa, tokens usados, modelo, response raw/reasoning si el
    modelo lo permite; guarda métricas por sesión (JSON/CSV) para benchmark.
@@ -77,13 +76,15 @@ propio (vault Obsidian / OpenNotebook) + local + gratis + extensible.**
   de validación en vivo; **B02** con intento de umbral agresivo revertido tras
   fallar en vivo y pendiente de calibración adaptativa; B03 (anti-sidetone
   pendiente de validar en vivo), B04 (frase corrupta al cierre), B05 (feed
-  arrastra texto viejo, mitigado), B06 (latencia push-to-ask), B07-B08 menores.
+  arrastra texto viejo, mitigado), B06 (streaming IA implementado y pendiente de
+  prueba en vivo), B07-B08 menores.
 - Antes de Sprint 1: hacer un **commit local pequeño de Fase 0**; no hacer push
   salvo solicitud explícita.
 - El plugin instalado en
   `~/.config/DankMaterialShell/plugins/voxtypeOverlay/` ya es **symlink** al repo,
   por lo que los cambios QML se recargan sin copia manual.
-- `chat_completion_stream` no implementado (bloquea streaming).
+- `chat_completion_stream` endurecido con SSE robusto, reintentos previos al
+  primer token y telemetría; pendiente prueba en vivo.
 - `kb_index.py` = embeddings locales (sentence-transformers+torch) — candidato a
   ser REEMPLAZADO por OpenNotebook cuando la integración esté lista.
 
@@ -102,16 +103,19 @@ propio (vault Obsidian / OpenNotebook) + local + gratis + extensible.**
       silencio y otra de voz baja.
 
 ### Sprint 1 — Prioridad ALTA ("lo primero", habilita UX y benchmarking)
-- [ ] **Modo debug** (toggle, default OFF): métricas por etapa
-      (VAD→whisper→IA), latencia total, tokens, modelo; guardado JSON/CSV por
-      sesión; mostrar reasoning/response raw cuando el modelo lo permita.
-- [ ] **Botón "Sugerir"** (renombra "Preguntar"): single-click, sin mantener
-      presionado. Toma transcripción reciente + contexto y llama a la IA.
-      Eliminar el flujo de pulsación larga (ScrollLock en modo reunión deja de
-      ser push-to-hold; pasa a trigger de sugerencia).
-- [ ] **Streaming de IA**: implementar `chat_completion_stream` y renderizar
-      tokens progresivos en el feed (estado "💭 pensando…" → token a token).
-      Objetivo latencia percibida ≤~2s.
+- [x] **Modo debug** implementado y pendiente de prueba en vivo (toggle, default
+      OFF): métricas por etapa (VAD→whisper→IA), latencia total, tokens, modelo;
+      guardado JSONL/CSV por sesión; respuesta cruda recortada cuando el modelo
+      la entrega.
+- [x] **Botón "Sugerir"** implementado y pendiente de prueba en vivo
+      (renombra "Preguntar"): single-click, sin mantener presionado. Toma las
+      últimas 10 frases transcritas + contexto y llama a la IA. Se eliminó el
+      flujo de pulsación larga; ScrollLock vuelve a ser solo dictado.
+- [x] **Streaming de IA** implementado y pendiente de prueba en vivo: generator
+      SSE robusto, eventos `ai_stream_start/delta/done/error`, render progresivo
+      en el feed y fallback sincrónico cuando no hay tokens. Objetivo latencia
+      percibida ≤~2s. Los micro-saltos residuales del render se siguen en B11;
+      el retardo del primer token es del proveedor.
       **Spec técnica completa**: `docs/STREAMING-IA-SPEC.md` (7 secciones:
       flujo actual, cambios en omniroute_client.py, auditor.py,
       AuditorThread.qml, OverlayWindow.qml, testing plan, riesgos).
